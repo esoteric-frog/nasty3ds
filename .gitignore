@@ -1,0 +1,8 @@
+
+# Nasty3DS
+/vendor/
+/.build/
+/.superpowers/
+/.serena/
+/dist/
+/dist.failed-scan/

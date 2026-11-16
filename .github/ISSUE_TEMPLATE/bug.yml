@@ -1,0 +1,16 @@
+name: Bug report
+description: Something does not work
+labels: [bug]
+body:
+  - type: textarea
+    attributes: { label: What happened, description: What you did, what you expected, and what happened. }
+    validations: { required: true }
+  - type: input
+    attributes: { label: Mac and macOS version, placeholder: "MacBook Air M1, macOS 15.2" }
+    validations: { required: true }
+  - type: dropdown
+    attributes:
+      label: Area
+      options: [Game does not start or crashes, Picture or sound, Controller or keyboard, iPhone screen, Local play, Game library or saves, Other]
+  - type: textarea
+    attributes: { label: Log, description: "The last lines of ~/Library/Application Support/Nasty3DS/core.log. Do not attach game files.", render: text }

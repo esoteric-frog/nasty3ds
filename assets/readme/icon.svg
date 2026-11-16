@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Nasty3DS icon: two screens, one above the other"><title>Nasty3DS icon</title>
+  <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5C6BFA"/><stop offset="1" stop-color="#1A1C3D"/></linearGradient></defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#g)"/>
+  <rect x="262" y="194" width="500" height="300" rx="34" fill="#fff" fill-opacity="0.96"/>
+  <rect x="312" y="530" width="400" height="300" rx="34" fill="#fff" fill-opacity="0.62"/>
+</svg>

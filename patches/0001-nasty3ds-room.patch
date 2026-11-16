@@ -1,0 +1,901 @@
+diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
+index e28f9941b..0d5855da0 100644
+--- a/src/citra_libretro/CMakeLists.txt
++++ b/src/citra_libretro/CMakeLists.txt
+@@ -27,6 +27,7 @@ endif()
+ add_library(citra_libretro SHARED
+         citra_libretro.cpp
+         citra_libretro.h
++        nasty3ds_room.cpp
+         $<TARGET_OBJECTS:citra_libretro_common>)
+ 
+ set_target_properties(citra_libretro PROPERTIES OUTPUT_NAME "azahar_libretro")
+@@ -50,6 +51,7 @@ target_compile_definitions(audio_core PRIVATE HAVE_LIBRETRO)
+ target_compile_definitions(input_common PRIVATE HAVE_LIBRETRO)
+ 
+ target_link_libraries(citra_libretro PRIVATE citra_common citra_core)
++target_link_libraries(citra_libretro PRIVATE network)
+ target_link_libraries(citra_libretro PRIVATE Boost::boost dds-ktx libretro tsl::robin_map)
+ if(ENABLE_VULKAN)
+   target_link_libraries(citra_libretro PRIVATE sirit vulkan-headers vma)
+diff --git a/src/citra_libretro/libretro.osx.def b/src/citra_libretro/libretro.osx.def
+index 53a556a60..e83ee5941 100644
+--- a/src/citra_libretro/libretro.osx.def
++++ b/src/citra_libretro/libretro.osx.def
+@@ -25,3 +25,10 @@ _retro_unload_game
+ _retro_get_region
+ _retro_get_memory_data
+ _retro_get_memory_size
++_nasty3ds_room_host
++_nasty3ds_room_join
++_nasty3ds_room_leave
++_nasty3ds_room_state
++_nasty3ds_room_members
++_nasty3ds_room_shutdown
++_nasty3ds_room_init
+diff --git a/src/citra_libretro/nasty3ds_room.cpp b/src/citra_libretro/nasty3ds_room.cpp
+new file mode 100644
+index 000000000..a4a90f740
+--- /dev/null
++++ b/src/citra_libretro/nasty3ds_room.cpp
+@@ -0,0 +1,183 @@
++// Nasty3DS: local wireless play for the libretro core.
++// The 3DS "local wireless" (UDS) of this emulator goes through a "room": one player hosts a
++// room, the others join it. The libretro core has no way to start one, so the host app calls
++// these functions. They are plain C so a host can find them with dlsym.
++
++#include <atomic>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include "common/logging/log.h"
++#include "core/core.h"
++#include "core/hle/service/cfg/cfg.h"
++#include "network/network.h"
++#include "network/verify_user.h"
++
++namespace {
++std::mutex room_mutex;
++bool network_ready = false;
++std::atomic<int> last_error{-1};
++
++bool EnsureNetwork() {
++    if (!network_ready) {
++        network_ready = Network::Init();
++        if (network_ready) {
++            if (auto member = Network::GetRoomMember().lock()) {
++                member->BindOnError([](const Network::RoomMember::Error& error) {
++                    last_error = static_cast<int>(error);
++                });
++            }
++        }
++    }
++    return network_ready;
++}
++
++int JoinLocked(const char* nickname, const char* address, unsigned short port) {
++    auto member = Network::GetRoomMember().lock();
++    if (!member || !nickname || !address) {
++        return 1;
++    }
++    auto& system = Core::System::GetInstance();
++    if (!system.IsPoweredOn()) {
++        return 2; // a game must run first: the console ID comes from the running system
++    }
++    if (member->IsConnected()) {
++        member->Leave();
++    }
++    last_error = -1;
++    member->Join(nickname, Service::CFG::GetConsoleIdHash(system), address, port, 0,
++                 Network::NoPreferredMac, "", "");
++    return 0;
++}
++} // namespace
++
++extern "C" {
++
++/// Call this before a game loads. The game's wireless service takes its link to the room
++/// member when it starts; with no network at that time, packets never reach the game.
++/// Returns 0, or 1 = the network did not start.
++__attribute__((visibility("default"))) int nasty3ds_room_init(void) {
++    std::scoped_lock lock{room_mutex};
++    return EnsureNetwork() ? 0 : 1;
++}
++
++/// Hosts a room on this machine and joins it. Returns 0, or 1 = network failed,
++/// 2 = no game runs, 3 = the port is in use.
++__attribute__((visibility("default"))) int nasty3ds_room_host(const char* nickname,
++                                                              unsigned short port,
++                                                              unsigned max_players) {
++    std::scoped_lock lock{room_mutex};
++    if (!EnsureNetwork()) {
++        return 1;
++    }
++    auto room = Network::GetRoom().lock();
++    if (!room) {
++        return 1;
++    }
++    if (room->GetState() == Network::Room::State::Open) {
++        room->Destroy();
++    }
++    if (!room->Create("Nasty3DS", "", "", port, "", max_players, nickname ? nickname : "", "", 0,
++                      std::make_unique<Network::VerifyUser::NullBackend>(), {})) {
++        return 3;
++    }
++    const int result = JoinLocked(nickname, "127.0.0.1", port);
++    if (result != 0) {
++        room->Destroy(); // never leave a room open that the app does not know about
++    }
++    return result;
++}
++
++/// Joins a room that another player hosts. Returns 0, 1 or 2 as above. The join is not
++/// finished when this returns: read nasty3ds_room_state.
++__attribute__((visibility("default"))) int nasty3ds_room_join(const char* nickname,
++                                                              const char* address,
++                                                              unsigned short port) {
++    std::scoped_lock lock{room_mutex};
++    if (!EnsureNetwork()) {
++        return 1;
++    }
++    if (auto room = Network::GetRoom().lock();
++        room && room->GetState() == Network::Room::State::Open) {
++        room->Destroy(); // a room that this machine hosts closes before it joins another one
++    }
++    return JoinLocked(nickname, address, port);
++}
++
++/// Leaves the room, and closes it if this machine hosts it.
++__attribute__((visibility("default"))) void nasty3ds_room_leave(void) {
++    std::scoped_lock lock{room_mutex};
++    if (!network_ready) {
++        return;
++    }
++    if (auto member = Network::GetRoomMember().lock(); member && member->IsConnected()) {
++        member->Leave();
++    }
++    if (auto room = Network::GetRoom().lock();
++        room && room->GetState() == Network::Room::State::Open) {
++        room->Destroy();
++    }
++}
++
++/// 0 = not in a room, 1 = joining, 2 = joined. Below 0: -(1 + RoomMember::Error) of the
++/// last failed join (for example -7 = wrong version, -9 = could not connect).
++__attribute__((visibility("default"))) int nasty3ds_room_state(void) {
++    std::scoped_lock lock{room_mutex};
++    if (!network_ready) {
++        return 0;
++    }
++    auto member = Network::GetRoomMember().lock();
++    if (!member) {
++        return 0;
++    }
++    switch (member->GetState()) {
++    case Network::RoomMember::State::Joining:
++        return 1;
++    case Network::RoomMember::State::Joined:
++    case Network::RoomMember::State::Moderator:
++        return 2;
++    default: {
++        const int error = last_error.load();
++        return error >= 0 ? -(1 + error) : 0;
++    }
++    }
++}
++
++/// Writes the nicknames of the players in the room, one per line, into `out`.
++/// Returns how many players are in the room.
++__attribute__((visibility("default"))) int nasty3ds_room_members(char* out, unsigned long length) {
++    std::scoped_lock lock{room_mutex};
++    if (out && length > 0) {
++        out[0] = 0;
++    }
++    if (!network_ready) {
++        return 0;
++    }
++    auto member = Network::GetRoomMember().lock();
++    if (!member || !member->IsConnected()) {
++        return 0;
++    }
++    std::string text;
++    int count = 0;
++    for (const auto& info : member->GetMemberInformation()) {
++        text += info.nickname;
++        text += '\n';
++        count++;
++    }
++    if (out && length > 0) {
++        std::strncpy(out, text.c_str(), length - 1);
++        out[length - 1] = 0;
++    }
++    return count;
++}
++
++/// Call before the core unloads.
++__attribute__((visibility("default"))) void nasty3ds_room_shutdown(void) {
++    std::scoped_lock lock{room_mutex};
++    if (network_ready) {
++        Network::Shutdown();
++        network_ready = false;
++    }
++}
++
++} // extern "C"
+diff --git a/src/core/hle/service/nwm/nwm_uds.cpp b/src/core/hle/service/nwm/nwm_uds.cpp
+index 8285ef4c0..8145d8f61 100644
+--- a/src/core/hle/service/nwm/nwm_uds.cpp
++++ b/src/core/hle/service/nwm/nwm_uds.cpp
+@@ -95,8 +95,8 @@ u16 NWM_UDS::GetNextAvailableNodeId() {
+             return index + 1;
+     }
+ 
+-    // Any connection attempts to an already full network should have been refused.
+-    UNREACHABLE_MSG("No available connection slots in the network");
++    // Nasty3DS: frames from the network can fill every slot. 0 means "no slot"; the caller
++    // refuses the node. It must not stop the program.
+     return 0;
+ }
+ 
+@@ -136,12 +136,26 @@ void NWM_UDS::HandleNodeMapPacket(const Network::WifiPacket& packet) {
+         LOG_DEBUG(Service_NWM, "Ignored NodeMapPacket since connection_status is host");
+         return;
+     }
++    // Nasty3DS: a node map means something only to a client of a network.
++    if (connection_status.status != NetworkStatus::Connecting &&
++        connection_status.status != NetworkStatus::ConnectedAsClient &&
++        connection_status.status != NetworkStatus::ConnectedAsSpectator) {
++        return;
++    }
+ 
+     node_map.clear();
+     std::size_t num_entries;
+     Network::MacAddress address;
+     u16 id;
++    // Nasty3DS: the entry count comes from the network. It must fit in the packet.
++    const std::size_t entry_size = sizeof(address) + sizeof(id);
++    if (packet.data.size() < sizeof(num_entries)) {
++        return;
++    }
+     std::memcpy(&num_entries, packet.data.data(), sizeof(num_entries));
++    if (num_entries > (packet.data.size() - sizeof(num_entries)) / entry_size) {
++        return;
++    }
+     std::size_t offset = sizeof(num_entries);
+     for (std::size_t i = 0; i < num_entries; ++i) {
+         std::memcpy(&address, packet.data.data() + offset, sizeof(address));
+@@ -153,6 +167,9 @@ void NWM_UDS::HandleNodeMapPacket(const Network::WifiPacket& packet) {
+ }
+ 
+ void NWM_UDS::HandleBeaconFrame(const Network::WifiPacket& packet) {
++    if (packet.data.size() > 0x400) { // Nasty3DS: a real beacon is a few hundred bytes
++        return;
++    }
+     std::scoped_lock lock(beacon_mutex);
+     const auto unique_beacon =
+         std::find_if(received_beacons.begin(), received_beacons.end(),
+@@ -174,8 +191,11 @@ void NWM_UDS::HandleBeaconFrame(const Network::WifiPacket& packet) {
+ void NWM_UDS::HandleAssociationResponseFrame(const Network::WifiPacket& packet) {
+     auto assoc_result = GetAssociationResult(packet.data);
+ 
+-    ASSERT_MSG(std::get<AssocStatus>(assoc_result) == AssocStatus::Successful,
+-               "Could not join network");
++    // Nasty3DS: the status comes from the network. A refusal must not stop the program.
++    if (std::get<AssocStatus>(assoc_result) != AssocStatus::Successful) {
++        LOG_ERROR(Service_NWM, "Could not join network");
++        return;
++    }
+     {
+         std::scoped_lock lock(connection_status_mutex);
+         if (connection_status.status != NetworkStatus::Connecting) {
+@@ -221,7 +241,10 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
+             return;
+         }
+ 
+-        ASSERT(connection_status.max_nodes != connection_status.total_nodes);
++        // Nasty3DS: a full network must not stop the program.
++        if (connection_status.max_nodes == connection_status.total_nodes) {
++            return;
++        }
+ 
+         auto eapol_start = DeserializeEAPolStartPacket(packet.data);
+ 
+@@ -230,6 +253,9 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
+         if (eapol_start.connection_type == ConnectionType::Client) {
+             // Get an unused network node id
+             u16 node_id = GetNextAvailableNodeId();
++            if (node_id == 0 || node_id > UDSMaxNodes) { // Nasty3DS: no free slot
++                return;
++            }
+             node.network_node_id = node_id;
+ 
+             connection_status.node_bitmask |= 1 << (node_id - 1);
+@@ -286,10 +312,11 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
+         connection_status.max_nodes = logoff.max_nodes;
+ 
+         node_info.clear();
+-        node_info.resize(network_info.max_nodes);
++        // Nasty3DS: the node count and each node number come from the network.
++        node_info.resize(std::min<std::size_t>(network_info.max_nodes, UDSMaxNodes));
+         for (const auto& node : logoff.nodes) {
+             const u16 index = node.network_node_id;
+-            if (!index) {
++            if (!index || index > node_info.size()) {
+                 continue;
+             }
+ 
+@@ -331,10 +358,11 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
+         connection_status.node_bitmask = 0;
+ 
+         node_info.clear();
+-        node_info.resize(network_info.max_nodes);
++        // Nasty3DS: the node count and each node number come from the network.
++        node_info.resize(std::min<std::size_t>(network_info.max_nodes, UDSMaxNodes));
+         for (const auto& node : logoff.nodes) {
+             const u16 index = node.network_node_id;
+-            if (!index) {
++            if (!index || index > node_info.size()) {
+                 continue;
+             }
+ 
+@@ -391,7 +419,17 @@ void NWM_UDS::HandleSecureDataPacket(const Network::WifiPacket& packet) {
+ 
+     // The packet is addressed to us (or to everyone using the broadcast node id), handle it.
+     // TODO(B3N30): We don't currently send nor handle management frames.
+-    ASSERT(!secure_data.is_management);
++    // Nasty3DS: the flag comes from the network. It must not stop the program.
++    if (secure_data.is_management) {
++        return;
++    }
++    // The sizes in the header must fit in the frame: PullPacket copies that many bytes later.
++    if (packet.data.size() < sizeof(LLCHeader) + sizeof(SecureDataHeader) ||
++        secure_data.protocol_size < sizeof(SecureDataHeader) ||
++        secure_data.GetActualDataSize() >
++            packet.data.size() - sizeof(LLCHeader) - sizeof(SecureDataHeader)) {
++        return;
++    }
+ 
+     // TODO(B3N30): Allow more than one bind node per channel.
+     auto channel_info = channel_data.find(secure_data.data_channel);
+@@ -405,7 +443,10 @@ void NWM_UDS::HandleSecureDataPacket(const Network::WifiPacket& packet) {
+         return;
+     }
+ 
+-    // Add the received packet to the data queue.
++    // Add the received packet to the data queue. Nasty3DS: the queue has a limit.
++    if (channel_info->second.received_packets.size() >= 256) {
++        channel_info->second.received_packets.pop_front();
++    }
+     channel_info->second.received_packets.emplace_back(packet.data);
+ 
+     // Signal the data event. We can do this directly because we use SignalEventAsync
+@@ -461,7 +502,9 @@ void NWM_UDS::HandleAuthenticationFrame(const Network::WifiPacket& packet) {
+     if (GetAuthenticationSeqNumber(packet.data) == AuthenticationSeq::SEQ1) {
+         using Network::WifiPacket;
+         AuthenticationFrame auth_request;
+-        memcpy(&auth_request, packet.data.data(), sizeof(auth_request));
++        std::memset(&auth_request, 0, sizeof(auth_request)); // Nasty3DS: a short frame is safe
++        std::memcpy(&auth_request, packet.data.data(),
++                    std::min(sizeof(auth_request), packet.data.size()));
+         WifiPacket auth_response;
+         {
+             std::scoped_lock lock(connection_status_mutex);
+@@ -526,6 +569,9 @@ void NWM_UDS::HandleDeauthenticationFrame(const Network::WifiPacket& packet) {
+     }
+ 
+     if (!node.spec) {
++        if (node.node_id == 0 || node.node_id > UDSMaxNodes) { // Nasty3DS: the id is an index
++            return;
++        }
+         connection_status.node_bitmask &= ~(1 << (node.node_id - 1));
+         connection_status.changed_nodes |= 1 << (node.node_id - 1);
+         connection_status.total_nodes--;
+@@ -554,6 +600,10 @@ void NWM_UDS::OnWifiPacketReceived(const Network::WifiPacket& packet) {
+     if (!initialized) {
+         return;
+     }
++    // Nasty3DS: a real frame is under 2 KB. A very large one is not from a game.
++    if (packet.data.size() > 0x2000) {
++        return;
++    }
+     switch (packet.type) {
+     case Network::WifiPacket::PacketType::Beacon:
+         HandleBeaconFrame(packet);
+@@ -654,6 +704,7 @@ void NWM_UDS::RecvBeaconBroadcastData(Kernel::HLERequestContext& ctx) {
+     data_reply_header.total_entries = static_cast<u32>(beacons.size());
+     data_reply_header.max_output_size = out_buffer_size;
+ 
++    u32 written_entries = 0; // Nasty3DS: the count that is really in the buffer
+     // Write each of the received beacons into the buffer
+     for (const auto& beacon : beacons) {
+         BeaconEntryHeader entry{};
+@@ -664,7 +715,11 @@ void NWM_UDS::RecvBeaconBroadcastData(Kernel::HLERequestContext& ctx) {
+         entry.header_size = sizeof(BeaconEntryHeader);
+         entry.mac_address = beacon.transmitter_address;
+ 
+-        ASSERT(cur_buffer_size < out_buffer_size);
++        // Nasty3DS: beacons come from the network. One that does not fit is left out.
++        if (cur_buffer_size + sizeof(BeaconEntryHeader) + beacon.data.size() > out_buffer_size) {
++            break;
++        }
++        ++written_entries;
+ 
+         out_buffer.Write(&entry, cur_buffer_size, sizeof(BeaconEntryHeader));
+         cur_buffer_size += sizeof(BeaconEntryHeader);
+@@ -675,6 +730,7 @@ void NWM_UDS::RecvBeaconBroadcastData(Kernel::HLERequestContext& ctx) {
+ 
+     // Update the total size in the structure and write it to the buffer again.
+     data_reply_header.total_size = static_cast<u32>(cur_buffer_size);
++    data_reply_header.total_entries = written_entries;
+     out_buffer.Write(&data_reply_header, 0, sizeof(BeaconDataReplyHeader));
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+@@ -1332,7 +1388,7 @@ Common::Expected<int, ResultStatus> NWM_UDS::PullPacketHLE(u32 bind_node_id, u32
+         *reinterpret_cast<SecureDataHeader*>(secure_data_out) = secure_data;
+     }
+ 
+-    if (data_size > max_out_buff_size) {
++    if (data_size > max_out_buff_size || data_size > buff_size) { // Nasty3DS: both limits
+         LOG_ERROR(Service_NWM, "Data size was too large.");
+         return Common::Unexpected(ResultStatus::RecvError_PacketSizeTooLarge);
+     }
+@@ -1560,45 +1616,46 @@ void NWM_UDS::DecryptBeaconData(Kernel::HLERequestContext& ctx) {
+ 
+     // Read the encrypted data.
+     // The first 4 bytes should be the OUI and the OUI Type of the tags.
+-    std::array<u8, 3> oui;
+-    std::memcpy(oui.data(), encrypted_data0_buffer.data(), oui.size());
+-    ASSERT_MSG(oui == NintendoOUI, "Unexpected OUI");
+-
+-    ASSERT_MSG(encrypted_data0_buffer[3] == static_cast<u8>(NintendoTagId::EncryptedData0),
+-               "Unexpected tag id");
+-
+-    std::vector<u8> beacon_data(encrypted_data0_buffer.size() - 4 + encrypted_data1_buffer.size() -
+-                                4);
+-    std::memcpy(beacon_data.data(), encrypted_data0_buffer.data() + 4,
+-                encrypted_data0_buffer.size() - 4);
+-    std::memcpy(beacon_data.data() + encrypted_data0_buffer.size() - 4,
+-                encrypted_data1_buffer.data() + 4, encrypted_data1_buffer.size() - 4);
+-
+-    // Decrypt the data
+-    DecryptBeacon(net_info, beacon_data);
+-
+-    // The beacon data header contains the MD5 hash of the data.
+-    BeaconData beacon_header;
+-    std::memcpy(&beacon_header, beacon_data.data(), sizeof(beacon_header));
+-
+-    // TODO(Subv): Verify the MD5 hash of the data and return 0xE1211005 if invalid.
+-
+-    const std::size_t num_nodes = net_info.max_nodes;
+-
++    // Nasty3DS: both tags and the node count come from a beacon on the network. Check them;
++    // a bad beacon gives an empty node list and must not stop the program.
+     std::vector<NodeInfo> nodes;
+-    nodes.reserve(num_nodes);
+-
+-    for (std::size_t i = 0; i < num_nodes; ++i) {
+-        BeaconNodeInfo info;
+-        std::memcpy(&info, beacon_data.data() + sizeof(beacon_header) + i * sizeof(info),
+-                    sizeof(info));
+-
+-        // Deserialize the node information.
+-        auto& node = nodes.emplace_back();
+-        node.friend_code_seed = info.friend_code_seed;
+-        node.network_node_id = info.network_node_id;
+-        for (std::size_t j = 0; j < info.username.size(); ++j) {
+-            node.username[j] = info.username[j];
++    const bool tags_ok =
++        encrypted_data0_buffer.size() >= 4 && encrypted_data1_buffer.size() >= 4 &&
++        std::memcmp(encrypted_data0_buffer.data(), NintendoOUI.data(), NintendoOUI.size()) == 0 &&
++        encrypted_data0_buffer[3] == static_cast<u8>(NintendoTagId::EncryptedData0);
++    if (tags_ok) {
++        std::vector<u8> beacon_data(encrypted_data0_buffer.size() - 4 +
++                                    encrypted_data1_buffer.size() - 4);
++        std::memcpy(beacon_data.data(), encrypted_data0_buffer.data() + 4,
++                    encrypted_data0_buffer.size() - 4);
++        std::memcpy(beacon_data.data() + encrypted_data0_buffer.size() - 4,
++                    encrypted_data1_buffer.data() + 4, encrypted_data1_buffer.size() - 4);
++
++        // Decrypt the data
++        DecryptBeacon(net_info, beacon_data);
++
++        // The beacon data header contains the MD5 hash of the data.
++        // TODO(Subv): Verify the MD5 hash of the data and return 0xE1211005 if invalid.
++        const std::size_t room =
++            beacon_data.size() > sizeof(BeaconData)
++                ? (beacon_data.size() - sizeof(BeaconData)) / sizeof(BeaconNodeInfo)
++                : 0;
++        const std::size_t num_nodes =
++            std::min<std::size_t>({net_info.max_nodes, UDSMaxNodes, room});
++        nodes.reserve(num_nodes);
++
++        for (std::size_t i = 0; i < num_nodes; ++i) {
++            BeaconNodeInfo info;
++            std::memcpy(&info, beacon_data.data() + sizeof(BeaconData) + i * sizeof(info),
++                        sizeof(info));
++
++            // Deserialize the node information.
++            auto& node = nodes.emplace_back();
++            node.friend_code_seed = info.friend_code_seed;
++            node.network_node_id = info.network_node_id;
++            for (std::size_t j = 0; j < info.username.size(); ++j) {
++                node.username[j] = info.username[j];
++            }
+         }
+     }
+ 
+diff --git a/src/core/hle/service/nwm/uds_connection.cpp b/src/core/hle/service/nwm/uds_connection.cpp
+index 4f20cf937..de701b596 100644
+--- a/src/core/hle/service/nwm/uds_connection.cpp
++++ b/src/core/hle/service/nwm/uds_connection.cpp
+@@ -1,3 +1,5 @@
++#include <cstring>
++#include <algorithm>
+ // Copyright 2017 Citra Emulator Project
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+@@ -6,6 +8,18 @@
+ #include "core/hle/service/nwm/nwm_uds.h"
+ #include "core/hle/service/nwm/uds_connection.h"
+ 
++namespace {
++/// Nasty3DS: copies a fixed struct out of a frame from the network. A frame that is too
++/// short gives zero bytes for the part that is missing; it never reads past the frame.
++template <typename Frame>
++void SafeCopy(void* out, std::size_t size, const Frame& frame, std::size_t offset = 0) {
++    std::memset(out, 0, size);
++    if (frame.size() > offset) {
++        std::memcpy(out, frame.data() + offset, std::min(size, frame.size() - offset));
++    }
++}
++} // namespace
++
+ namespace Service::NWM {
+ 
+ // Note: These values were taken from a packet capture of an o3DS XL
+@@ -24,7 +38,7 @@ std::vector<u8> GenerateAuthenticationFrame(AuthenticationSeq seq) {
+ 
+ AuthenticationSeq GetAuthenticationSeqNumber(std::span<const u8> body) {
+     AuthenticationFrame frame;
+-    std::memcpy(&frame, body.data(), sizeof(frame));
++    SafeCopy(&frame, sizeof(frame), body);
+ 
+     return frame.auth_seq;
+ }
+@@ -76,7 +90,7 @@ std::vector<u8> GenerateAssocResponseFrame(AssocStatus status, u16 association_i
+ 
+ std::tuple<AssocStatus, u16> GetAssociationResult(std::span<const u8> body) {
+     AssociationResponseFrame frame;
+-    std::memcpy(&frame, body.data(), sizeof(frame));
++    SafeCopy(&frame, sizeof(frame), body);
+ 
+     constexpr u16 AssociationIdMask = 0x3FFF;
+     return std::make_tuple(frame.status_code, frame.assoc_id & AssociationIdMask);
+diff --git a/src/core/hle/service/nwm/uds_data.cpp b/src/core/hle/service/nwm/uds_data.cpp
+index 1d66da3ec..7eab3d6cf 100644
+--- a/src/core/hle/service/nwm/uds_data.cpp
++++ b/src/core/hle/service/nwm/uds_data.cpp
+@@ -15,6 +15,18 @@
+ #include "core/hle/service/nwm/uds_data.h"
+ #include "core/hw/aes/key.h"
+ 
++namespace {
++/// Nasty3DS: copies a fixed struct out of a frame from the network. A frame that is too
++/// short gives zero bytes for the part that is missing; it never reads past the frame.
++template <typename Frame>
++void SafeCopy(void* out, std::size_t size, const Frame& frame, std::size_t offset = 0) {
++    std::memset(out, 0, size);
++    if (frame.size() > offset) {
++        std::memcpy(out, frame.data() + offset, std::min(size, frame.size() - offset));
++    }
++}
++} // namespace
++
+ namespace Service::NWM {
+ 
+ using MacAddress = std::array<u8, 6>;
+@@ -281,7 +293,7 @@ SecureDataHeader ParseSecureDataHeader(std::span<const u8> data) {
+     SecureDataHeader header;
+ 
+     // Skip the LLC header
+-    std::memcpy(&header, data.data() + sizeof(LLCHeader), sizeof(header));
++    SafeCopy(&header, sizeof(header), data, sizeof(LLCHeader));
+ 
+     return header;
+ }
+@@ -312,14 +324,14 @@ std::vector<u8> GenerateEAPoLStartFrame(u16 association_id, ConnectionType conn_
+ 
+ EtherType GetFrameEtherType(std::span<const u8> frame) {
+     LLCHeader header;
+-    std::memcpy(&header, frame.data(), sizeof(header));
++    SafeCopy(&header, sizeof(header), frame);
+     return header.protocol;
+ }
+ 
+ u16 GetEAPoLFrameType(std::span<const u8> frame) {
+     // Ignore the LLC header
+     u16_be eapol_type;
+-    std::memcpy(&eapol_type, frame.data() + sizeof(LLCHeader), sizeof(eapol_type));
++    SafeCopy(&eapol_type, sizeof(eapol_type), frame, sizeof(LLCHeader));
+     return eapol_type;
+ }
+ 
+@@ -327,7 +339,7 @@ NodeInfo DeserializeNodeInfoFromFrame(std::span<const u8> frame) {
+     EAPoLStartPacket eapol_start;
+ 
+     // Skip the LLC header
+-    std::memcpy(&eapol_start, frame.data() + sizeof(LLCHeader), sizeof(eapol_start));
++    SafeCopy(&eapol_start, sizeof(eapol_start), frame, sizeof(LLCHeader));
+ 
+     return DeserializeNodeInfo(eapol_start.node);
+ }
+@@ -372,14 +384,14 @@ EAPoLLogoffPacket ParseEAPoLLogoffFrame(std::span<const u8> frame) {
+     EAPoLLogoffPacket eapol_logoff;
+ 
+     // Skip the LLC header
+-    std::memcpy(&eapol_logoff, frame.data() + sizeof(LLCHeader), sizeof(eapol_logoff));
++    SafeCopy(&eapol_logoff, sizeof(eapol_logoff), frame, sizeof(LLCHeader));
+     return eapol_logoff;
+ }
+ 
+ EAPoLStartPacket DeserializeEAPolStartPacket(std::span<const u8> frame) {
+     EAPoLStartPacket eapol_start;
+ 
+-    std::memcpy(&eapol_start, frame.data() + sizeof(LLCHeader), sizeof(eapol_start));
++    SafeCopy(&eapol_start, sizeof(eapol_start), frame, sizeof(LLCHeader));
+     return eapol_start;
+ }
+ 
+diff --git a/src/network/packet.h b/src/network/packet.h
+index e07cb0136..57886c584 100644
+--- a/src/network/packet.h
++++ b/src/network/packet.h
+@@ -122,6 +122,12 @@ Packet& Packet::operator>>(std::vector<T>& out_data) {
+     // First extract the size
+     u32 size = 0;
+     *this >> size;
++    // Nasty3DS: the size comes from the network. It cannot be more than the bytes that are left.
++    if (!is_valid || read_pos > data.size() || size > data.size() - read_pos) {
++        is_valid = false;
++        out_data.clear();
++        return *this;
++    }
+     out_data.resize(size);
+ 
+     // Then extract the data
+diff --git a/src/network/room.cpp b/src/network/room.cpp
+index a30ab0acb..11e9e0d60 100644
+--- a/src/network/room.cpp
++++ b/src/network/room.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
++#include <utility>
++#include <vector>
+ #include <mutex>
+ #include <random>
+ #include <regex>
+@@ -248,11 +251,34 @@ public:
+ 
+ // RoomImpl
+ void Room::RoomImpl::ServerLoop() {
++    // Nasty3DS: devices that connected but did not join yet, with the time they connected.
++    std::vector<std::pair<ENetPeer*, std::chrono::steady_clock::time_point>> pending;
+     while (state != State::Closed) {
++        {
++            // A device that connects and never joins must not hold a place in the room.
++            const auto now = std::chrono::steady_clock::now();
++            std::lock_guard lock(member_mutex);
++            std::erase_if(pending, [&](const auto& entry) {
++                if (now - entry.second < std::chrono::seconds(3)) {
++                    return false;
++                }
++                const bool joined =
++                    std::any_of(members.begin(), members.end(),
++                                [&](const Member& member) { return member.peer == entry.first; });
++                if (!joined) {
++                    enet_peer_reset(entry.first);
++                }
++                return true;
++            });
++        }
+         ENetEvent event;
+         if (enet_host_service(server, &event, 16) > 0) {
+             switch (event.type) {
+             case ENET_EVENT_TYPE_RECEIVE:
++                if (event.packet->dataLength == 0) { // Nasty3DS: data is null, do not read it
++                    enet_packet_destroy(event.packet);
++                    break;
++                }
+                 switch (event.packet->data[0]) {
+                 case IdJoinRequest:
+                     HandleJoinRequest(&event);
+@@ -283,10 +309,14 @@ void Room::RoomImpl::ServerLoop() {
+                 enet_packet_destroy(event.packet);
+                 break;
+             case ENET_EVENT_TYPE_DISCONNECT:
++                std::erase_if(pending,
++                              [&](const auto& entry) { return entry.first == event.peer; });
+                 HandleClientDisconnection(event.peer);
+                 break;
+-            case ENET_EVENT_TYPE_NONE:
+             case ENET_EVENT_TYPE_CONNECT:
++                pending.emplace_back(event.peer, std::chrono::steady_clock::now());
++                break;
++            case ENET_EVENT_TYPE_NONE:
+                 break;
+             }
+         }
+@@ -850,6 +880,17 @@ MacAddress Room::RoomImpl::GenerateMacAddress() {
+ }
+ 
+ void Room::RoomImpl::HandleWifiPacket(const ENetEvent* event) {
++    // Nasty3DS: only a member of the room can send game packets, and a real frame is small.
++    if (event->packet->dataLength > MaxWifiPacketSize) {
++        return;
++    }
++    {
++        std::lock_guard lock(member_mutex);
++        if (std::none_of(members.begin(), members.end(),
++                         [&](const Member& member) { return member.peer == event->peer; })) {
++            return;
++        }
++    }
+     Packet in_packet;
+     in_packet.Append(event->packet->data, event->packet->dataLength);
+     in_packet.IgnoreBytes(sizeof(u8));         // Message type
+@@ -1028,6 +1069,9 @@ bool Room::Create(const std::string& name, const std::string& description,
+     // In order to send the room is full message to the connecting client, we need to leave one
+     // slot open so enet won't reject the incoming connection without telling us
+     room_impl->server = enet_host_create(&address, max_connections + 1, NumChannels, 0, 0);
++    if (room_impl->server) { // Nasty3DS: no packet from the network is larger
++        room_impl->server->maximumPacketSize = 0x10000;
++    }
+     if (!room_impl->server) {
+         return false;
+     }
+diff --git a/src/network/room.h b/src/network/room.h
+index 9e6a7ef8d..c2db4c64b 100644
+--- a/src/network/room.h
++++ b/src/network/room.h
+@@ -17,6 +17,12 @@ constexpr u32 network_version = 4; ///< The version of this Room and RoomMember
+ 
+ constexpr u16 DefaultRoomPort = 24872;
+ 
++/// Nasty3DS: the largest game packet the room passes on. A real 3DS frame is under 2 KB.
++constexpr std::size_t MaxWifiPacketSize = 0x2000;
++
++/// Nasty3DS: the largest member list a room member accepts from a room.
++constexpr u32 MaxMemberListSize = 16;
++
+ constexpr u32 MaxMessageSize = 500;
+ 
+ /// Maximum number of concurrent connections allowed to this room.
+diff --git a/src/network/room_member.cpp b/src/network/room_member.cpp
+index decc4e555..08bae75b5 100644
+--- a/src/network/room_member.cpp
++++ b/src/network/room_member.cpp
+@@ -24,6 +24,8 @@ public:
+ 
+     /// Information about the clients connected to the same room as us.
+     MemberList member_information;
++    /// Nasty3DS: guards member_information, which another thread reads.
++    mutable std::mutex member_information_mutex;
+     /// Information about the room we're connected to.
+     RoomInformation room_information;
+ 
+@@ -163,6 +165,10 @@ void RoomMember::RoomMemberImpl::MemberLoop() {
+         if (enet_host_service(client, &event, 16) > 0) {
+             switch (event.type) {
+             case ENET_EVENT_TYPE_RECEIVE:
++                if (event.packet->dataLength == 0) { // Nasty3DS: data is null, do not read it
++                    enet_packet_destroy(event.packet);
++                    break;
++                }
+                 switch (event.packet->data[0]) {
+                 case IdWifiPacket:
+                     HandleWifiPackets(&event);
+@@ -180,8 +186,10 @@ void RoomMember::RoomMemberImpl::MemberLoop() {
+                 case IdJoinSuccessAsMod:
+                     // The join request was successful, we are now in the room.
+                     // If we joined successfully, there must be at least one client in the room: us.
+-                    ASSERT_MSG(member_information.size() > 0,
+-                               "We have not yet received member information.");
++                    // Nasty3DS: a hostile room can send this first. Do not stop the program.
++                    if (member_information.empty()) {
++                        break;
++                    }
+                     HandleJoinPacket(&event); // Get the MAC Address for the client
+                     if (event.packet->data[0] == IdJoinSuccessAsMod) {
+                         SetState(State::Moderator);
+@@ -241,6 +249,9 @@ void RoomMember::RoomMemberImpl::MemberLoop() {
+                 if (state == State::Joined || state == State::Moderator) {
+                     SetState(State::Idle);
+                     SetError(Error::LostConnection);
++                } else if (state == State::Joining) { // Nasty3DS: the room dropped us mid-join
++                    SetState(State::Idle);
++                    SetError(Error::CouldNotConnect);
+                 }
+                 break;
+             case ENET_EVENT_TYPE_NONE:
+@@ -248,7 +259,8 @@ void RoomMember::RoomMemberImpl::MemberLoop() {
+             case ENET_EVENT_TYPE_CONNECT:
+                 // The ENET_EVENT_TYPE_CONNECT event can not possibly happen here because we're
+                 // already connected
+-                ASSERT_MSG(false, "Received unexpected connect event while already connected");
++                // Nasty3DS: a hostile room can connect back. Refuse it; do not stop the program.
++                enet_peer_reset(event.peer);
+                 break;
+             }
+         }
+@@ -314,8 +326,12 @@ void RoomMember::RoomMemberImpl::HandleRoomInformationPacket(const ENetEvent* ev
+     room_information.preferred_game = info.preferred_game;
+     room_information.host_username = info.host_username;
+ 
+-    u32 num_members;
++    u32 num_members = 0;
+     packet >> num_members;
++    if (num_members > MaxMemberListSize) { // Nasty3DS: the count comes from the network
++        return;
++    }
++    std::lock_guard information_lock(member_information_mutex);
+     member_information.resize(num_members);
+ 
+     for (auto& member : member_information) {
+@@ -349,6 +365,9 @@ void RoomMember::RoomMemberImpl::HandleJoinPacket(const ENetEvent* event) {
+ }
+ 
+ void RoomMember::RoomMemberImpl::HandleWifiPackets(const ENetEvent* event) {
++    if (event->packet->dataLength > MaxWifiPacketSize) { // Nasty3DS: a real frame is small
++        return;
++    }
+     WifiPacket wifi_packet{};
+     Packet packet;
+     packet.Append(event->packet->data, event->packet->dataLength);
+@@ -415,7 +434,10 @@ void RoomMember::RoomMemberImpl::HandleModBanListResponsePacket(const ENetEvent*
+ }
+ 
+ void RoomMember::RoomMemberImpl::Disconnect() {
+-    member_information.clear();
++    {
++        std::lock_guard information_lock(member_information_mutex);
++        member_information.clear();
++    }
+     room_information.member_slots = 0;
+     room_information.name.clear();
+ 
+@@ -514,7 +536,8 @@ RoomMember::State RoomMember::GetState() const {
+     return room_member_impl->state;
+ }
+ 
+-const RoomMember::MemberList& RoomMember::GetMemberInformation() const {
++RoomMember::MemberList RoomMember::GetMemberInformation() const {
++    std::lock_guard information_lock(room_member_impl->member_information_mutex);
+     return room_member_impl->member_information;
+ }
+ 
+@@ -551,6 +574,9 @@ void RoomMember::Join(const std::string& nick, const std::string& console_id_has
+ 
+     if (!room_member_impl->client) {
+         room_member_impl->client = enet_host_create(nullptr, 1, NumChannels, 0, 0);
++        if (room_member_impl->client) { // Nasty3DS: no packet from the network is larger
++            room_member_impl->client->maximumPacketSize = 0x10000;
++        }
+         ASSERT_MSG(room_member_impl->client != nullptr, "Could not create client");
+     }
+ 
+diff --git a/src/network/room_member.h b/src/network/room_member.h
+index 4e9108757..de6f7016f 100644
+--- a/src/network/room_member.h
++++ b/src/network/room_member.h
+@@ -129,7 +129,7 @@ public:
+     /**
+      * Returns information about the members in the room we're currently connected to.
+      */
+-    const MemberList& GetMemberInformation() const;
++    MemberList GetMemberInformation() const; // Nasty3DS: a copy, taken under a lock
+ 
+     /**
+      * Returns the nickname of the RoomMember.
