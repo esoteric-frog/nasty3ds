@@ -37,7 +37,7 @@ The app loads Azahar's libretro core as a library, draws with Vulkan through Mol
 You need an Apple Silicon Mac, macOS 14 or later, the Xcode Command Line Tools, and [Homebrew](https://brew.sh).
 
 ```sh
-brew install cmake ninja molten-vk
+brew install cmake ninja molten-vk vulkan-headers
 git clone https://github.com/esoteric-frog/nasty3ds.git
 cd nasty3ds
 scripts/build-core.sh     # gets Azahar at a pinned commit, applies patches/, builds the engine (about 40 minutes)
