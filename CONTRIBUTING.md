@@ -15,7 +15,7 @@ Do not attach game files or save files that hold personal data.
 ## Set up
 
 ```sh
-brew install cmake ninja molten-vk
+brew install cmake ninja molten-vk vulkan-headers
 git clone https://github.com/esoteric-frog/nasty3ds.git
 cd nasty3ds
 scripts/test.sh          # unit tests; these need no engine

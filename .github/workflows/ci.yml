@@ -10,8 +10,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Install MoltenVK
-        run: brew install molten-vk
+      - name: Install MoltenVK and the Vulkan headers
+        run: brew install molten-vk vulkan-headers
       - name: Show tools
         run: swift --version
       - name: Unit tests
