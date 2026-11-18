@@ -2,16 +2,16 @@ import AppKit
 import CoreImage
 import Nasty3DSKit
 
-/// The Mac UI for the phone screen: toolbar button, pairing sheet, window shape, Settings window.
-final class PhoneController: NSObject, NSToolbarDelegate {
-    private static let toolbarItem = NSToolbarItem.Identifier("usePhone")
+/// The Mac UI for the phone screen: pairing sheet, Settings window.
+final class PhoneController: NSObject {
     /// The fingerprint of the certificate that the user put on the iPhone. A new certificate
     /// (the Mac got a new name) has another fingerprint, so the setup shows again, also after a restart.
     private static let setupDoneKey = "phoneCertificateFingerprint"
 
     let server = PhoneServer()
     private let window: NSWindow
-    private let gameView: GameView
+    /// True while the phone shows the lower screen. The owner of the windows moves the screens.
+    var onLowerOnPhone: ((Bool) -> Void)?
     private var gamePath: String?
     private var state = PhoneServer.State.stopped
 
@@ -32,15 +32,9 @@ final class PhoneController: NSObject, NSToolbarDelegate {
     private var settingsWindow: NSWindow?
     private var settingsText: NSTextField?
 
-    init(window: NSWindow, gameView: GameView) {
+    init(window: NSWindow) {
         self.window = window
-        self.gameView = gameView
         super.init()
-        let toolbar = NSToolbar(identifier: "game")
-        toolbar.delegate = self
-        toolbar.displayMode = .iconOnly
-        window.toolbar = toolbar
-        window.toolbarStyle = .unified
         server.onStateChange = { [weak self] in self?.stateChanged($0) }
         server.onTouch = { Emulator.shared.touch = $0 }
         server.onTrustProblem = { [weak self] in self?.trustProblem() }
@@ -129,18 +123,18 @@ final class PhoneController: NSObject, NSToolbarDelegate {
         state = new
         switch new {
         case .waiting:
-            setMode(.both)
+            onLowerOnPhone?(false)
             refreshSheet()
         case .connected:
             if let gamePath { server.setUsesPhone(true, game: gamePath) }
             markSetupDone()     // a connection proves the setup
             closeSheet()
-            setMode(.topOnly)
+            onLowerOnPhone?(true)
         case .stopped:
-            setMode(.both)
+            onLowerOnPhone?(false)
         case .failed(let message):
             closeSheet()
-            setMode(.both)
+            onLowerOnPhone?(false)
             let alert = NSAlert()
             alert.messageText = "The phone screen cannot start"
             alert.informativeText = message + "\nThe game continues with both screens on this Mac."
@@ -149,20 +143,6 @@ final class PhoneController: NSObject, NSToolbarDelegate {
             break
         }
         refreshSettings()
-    }
-
-    /// Keeps the window width; the height follows the screens that show.
-    private func setMode(_ mode: GameView.Mode) {
-        guard gameView.mode != mode else { return }
-        gameView.mode = mode
-        let ratio: CGFloat = mode == .topOnly ? 240.0 / 400.0 : 480.0 / 400.0
-        window.contentAspectRatio = NSSize(width: 400, height: 400 * ratio)
-        guard !window.styleMask.contains(.fullScreen) else { return }
-        var content = window.contentRect(forFrameRect: window.frame)
-        let top = content.maxY
-        content.size.height = content.width * ratio
-        content.origin.y = top - content.height
-        window.setFrame(window.frameRect(forContentRect: content), display: true, animate: true)
     }
 
     // MARK: pairing sheet
@@ -306,24 +286,6 @@ final class PhoneController: NSObject, NSToolbarDelegate {
         let image = NSImage(size: rep.size)
         image.addRepresentation(rep)
         return image
-    }
-
-    // MARK: toolbar
-
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.toolbarItem] }
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.toolbarItem] }
-
-    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier,
-                 willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
-        guard identifier == Self.toolbarItem else { return nil }
-        let item = NSToolbarItem(itemIdentifier: identifier)
-        item.label = "Use Phone"
-        item.toolTip = "Use Phone for Lower Screen"
-        item.image = NSImage(systemSymbolName: "iphone", accessibilityDescription: "Use Phone for Lower Screen")
-        item.isBordered = true
-        item.target = self
-        item.action = #selector(usePhone(_:))
-        return item
     }
 
     // MARK: Settings window

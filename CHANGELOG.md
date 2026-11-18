@@ -4,6 +4,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-18
+
+### Added
+- The lower screen can go in its own window (Game > Lower Screen in Its Own Window, or the button at the top right). The phone has priority: while it shows the lower screen, the Mac shows no second window.
+- View > Enter Full Screen for Lower Screen (Shift-Command-F). When the top screen goes to full screen and the lower screen is on another display, the lower screen goes to full screen too.
+
+### Changed
+- The game windows have no title bar. The window buttons and the controls show only while the pointer moves.
+
 ## [0.3.0] - 2026-11-15
 
 ### Added

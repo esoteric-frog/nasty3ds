@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let gameView = GameView(frame: NSRect(x: 0, y: 0, width: 800, height: 960))
     private var statusTimer: Timer?
     private var phone: PhoneController!
+    private var screens: ScreenWindows!
     private let localPlay = LocalPlay()
     private let homeView = HomeView(frame: NSRect(x: 0, y: 0, width: 800, height: 960))
     private let library = GameLibrary(folder: Emulator.supportDir)
@@ -22,10 +23,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                           backing: .buffered, defer: false)
         window.title = "Nasty3DS"
         window.contentView = gameView
-        phone = PhoneController(window: window, gameView: gameView)
-        window.contentAspectRatio = NSSize(width: 400, height: 480)
+        screens = ScreenWindows(window: window, gameView: gameView)
+        screens.onUsePhone = { [weak self] in self?.usePhone(nil) }
+        phone = PhoneController(window: window)
+        phone.onLowerOnPhone = { [weak self] in self?.screens.phoneHasLower = $0 }
         window.collectionBehavior = [.fullScreenPrimary]
         window.setFrameAutosaveName("GameWindow")
+        screens.restoreShape()
         window.center()
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(gameView)
@@ -62,6 +66,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(closeGame(_:)) || item.action == #selector(usePhone(_:)) { return gameRuns }
+        if item.action == #selector(toggleLowerFullScreen(_:)) {
+            item.title = screens.lowerIsFullScreen ? "Exit Full Screen for Lower Screen" : "Enter Full Screen for Lower Screen"
+            return screens.isSplit
+        }
+        if item.action == #selector(toggleSplit(_:)) {
+            item.state = screens.isSplit ? .on : .off
+            return screens.canSplit
+        }
         return true
     }
 
@@ -75,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         Emulator.shared.stop()
         audio = nil
         gameView.status = ""
+        screens.gameRuns = false
         showLibrary()
     }
 
@@ -153,6 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         window.contentMinSize = NSSize(width: 320, height: 192)
         window.contentView = gameView
         window.makeFirstResponder(gameView)
+        screens.gameRuns = true
         audio = try? AudioOut(sampleRate: emulator.sampleRate)
         emulator.onAudio = { [weak self] samples, frames in self?.audio?.enqueue(samples, frames: frames) }
         emulator.audioFill = { [weak self] in self?.audio?.fillFraction ?? 0.5 }
@@ -192,6 +206,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func openSettings(_ sender: Any?) { phone.showSettings(sender) }
     @objc func usePhone(_ sender: Any?) { phone.usePhone(sender) }
+    @objc func toggleSplit(_ sender: Any?) { screens.toggleSplit(sender) }
+    @objc func toggleLowerFullScreen(_ sender: Any?) { screens.toggleLowerFullScreen(sender) }
 
     /// "Local Play" has a submenu that LocalPlay fills each time it opens (rooms come and go).
     private func localPlayItem() -> NSMenuItem {
@@ -227,15 +243,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             .separator(),
             NSMenuItem(title: "Use Phone for Lower Screen", action: #selector(usePhone(_:)), keyEquivalent: "p"),
             NSMenuItem(title: "Show Phone QR Code", action: #selector(usePhone(_:)), keyEquivalent: ""),
+            NSMenuItem(title: "Lower Screen in Its Own Window", action: #selector(toggleSplit(_:)), keyEquivalent: "d"),
             .separator(),
             localPlayItem(),
         ])
         let fullScreen = NSMenuItem(title: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
         fullScreen.keyEquivalentModifierMask = [.command, .control]
-        add("View", [fullScreen])
+        let lowerFullScreen = NSMenuItem(title: "Enter Full Screen for Lower Screen", action: #selector(toggleLowerFullScreen(_:)), keyEquivalent: "f")
+        lowerFullScreen.keyEquivalentModifierMask = [.command, .shift]
+        add("View", [fullScreen, lowerFullScreen])
         add("Window", [
             NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"),
         ])
+        NSApp.windowsMenu = main.items.last?.submenu     // the system adds "Move to <display>" here
         return main
     }
 }
