@@ -11,7 +11,7 @@
 
 **Nasty3DS is a native Mac app that plays your own 3DS games: the top screen on the Mac, the lower screen with touch on your iPhone.** The engine is [Azahar](https://github.com/azahar-emu/azahar). The app around it is new and made for macOS.
 
-Status: early (version 0.3). It runs games at full speed on an M1 MacBook Air. See [Limits](#limits).
+Status: early (version 0.4). It runs games at full speed on an M1 MacBook Air. See [Limits](#limits).
 
 > [!IMPORTANT]
 > Bring your own games. The app has no games, does not download games, and does not decrypt games. Use files that you made from cartridges that you own.
