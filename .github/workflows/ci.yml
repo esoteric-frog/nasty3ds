@@ -9,7 +9,7 @@ jobs:
   unit:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install MoltenVK and the Vulkan headers
         run: brew install molten-vk vulkan-headers
       - name: Show tools
