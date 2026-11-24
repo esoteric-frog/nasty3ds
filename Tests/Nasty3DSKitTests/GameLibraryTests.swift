@@ -221,3 +221,21 @@ private func makeSave(_ lib: GameLibrary, _ id: UInt64, _ text: String, _ mtime:
     let names = try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("games").path)
     #expect(names == ["Far Game.cci"])                                  // no working file is left
 }
+
+@Test func beforeAnUpdateAllSavesAreCopied() throws {
+    let root = scratch()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let lib = GameLibrary(folder: root)
+    #expect(try lib.backUpAllSaves() == nil)                              // no saves folder: nothing to copy
+    let save = root.appendingPathComponent("saves/a/b/save.bin")
+    try FileManager.default.createDirectory(at: save.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let bytes = Data((0..<4096).map { _ in UInt8.random(in: 0...255) })
+    try bytes.write(to: save)
+    let copy = try #require(try lib.backUpAllSaves())
+    #expect(copy.lastPathComponent.hasPrefix("All saves before update "))
+    #expect(copy.deletingLastPathComponent().lastPathComponent == "save-backups")
+    #expect(try Data(contentsOf: copy.appendingPathComponent("saves/a/b/save.bin")) == bytes)
+    #expect(try Data(contentsOf: save) == bytes)                          // the saves stay as they are
+    let left = try FileManager.default.contentsOfDirectory(atPath: copy.deletingLastPathComponent().path)
+    #expect(!left.contains { $0.contains("partial") })
+}

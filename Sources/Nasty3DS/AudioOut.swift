@@ -22,6 +22,9 @@ final class AudioOut {
     private let engine = AVAudioEngine()
     private let ring: RingBuffer
     private var source: AVAudioSourceNode!
+    private var deviceChange: NSObjectProtocol?
+    /// For one line in core.log when the sound device changes.
+    var log: (String) -> Void = { _ in }
 
     init(sampleRate: Double) throws {
         capacity = Int(sampleRate * Self.bufferSeconds) * 2
@@ -49,6 +52,26 @@ final class AudioOut {
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
         try engine.start()
+        // A new sound device (headphones, AirPlay, a TV) stops the engine. It does not start again
+        // by itself: without this the game is silent until the next start of the app.
+        deviceChange = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in self?.restart(triesLeft: 3) }
+    }
+
+    deinit { if let deviceChange { NotificationCenter.default.removeObserver(deviceChange) } }
+
+    private func restart(triesLeft: Int) {
+        guard !engine.isRunning else { return }
+        do {
+            try engine.start()
+            log("[n3] sound device changed: the sound runs again")
+        } catch {
+            log("[n3] sound device changed: no start (\(error.localizedDescription)), tries left \(triesLeft)")
+            // A device that just arrived can need a moment before it takes sound.
+            guard triesLeft > 0 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.restart(triesLeft: triesLeft - 1) }
+        }
     }
 
     func enqueue(_ samples: UnsafePointer<Int16>, frames: Int) {

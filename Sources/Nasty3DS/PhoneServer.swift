@@ -5,7 +5,7 @@ import Network
 import UniformTypeIdentifiers
 
 /// Serves the lower screen to one phone on the local network.
-/// All state is owned by `queue`, except `pairing` and the round-trip time, which a lock guards.
+/// All state is owned by `queue`, except `pairing`, the active ports and the round-trip time, which a lock guards.
 final class PhoneServer {
     enum State: Equatable { case stopped, starting, waiting, connected, failed(String) }
 
@@ -25,13 +25,18 @@ final class PhoneServer {
     var onTrustProblem: (() -> Void)?
     /// Called on the server queue. Nil = finger up, or the phone is gone.
     var onTouch: (((u: Double, v: Double)?) -> Void)?
+    /// Called on the server queue with one line for the log, when a port is used for this session only.
+    /// It never holds the secret or the link.
+    var onNote: ((String) -> Void)?
 
-    private let defaults: UserDefaults
+    private let pairingFile: URL
+    private let legacy: [UserDefaults]      // the old places of the pairing; Forget Phone clears them too
     private let queue = DispatchQueue(label: "nasty3ds.phone")
     private let lock = NSLock()
     private var _pairing: Pairing
     private var _roundTripMs: Double?
     private var _wakeReport: String?
+    private var _activePagePort: UInt16 = 0, _activeLivePort: UInt16 = 0     // 0 while stopped
 
     private var pageListener: NWListener?
     private var liveListener: NWListener?
@@ -43,8 +48,23 @@ final class PhoneServer {
     private var waitingOrder: [NWConnection] = []         // oldest first
     /// How many connections the server holds now (page requests, waiting, the phone). For checks.
     var connectionCount: Int { queue.sync { pageConnections.count + waiting.count + (phone == nil ? 0 : 1) } }
+    /// How many times a phone said a correct hello. For checks.
+    var helloCount: Int { queue.sync { hellos } }
+    private var hellos = 0
+    /// For check-page only: true = no pings, no frames and no silence limit, like a link that
+    /// died with no close. The page must find that by itself.
+    var muteForCheck: Bool {
+        get { lock.withLock { _mute } }
+        set { lock.withLock { _mute = newValue } }
+    }
+    private var _mute = false
     private var gate = FrameGate<CGImage>()
     private var state = State.stopped
+    /// One more on each stop(). A port walk or a listener of an older start sees it and ends.
+    private var generation = 0
+    /// The generation whose port walks started. One start per generation: no second walk while
+    /// one runs or after one gave up. stop() begins a new generation.
+    private var startedGeneration = -1
     private var pingTimer: DispatchSourceTimer?
     private var pingSent: [Int: CFAbsoluteTime] = [:]
     private var pingID = 0
@@ -53,20 +73,31 @@ final class PhoneServer {
     private var lastSilentClose = 0.0
     private var secured = Set<ObjectIdentifier>()     // live connections with a finished TLS handshake
 
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
-        _pairing = Pairing.load(from: defaults)
+    /// `legacy`: the old UserDefaults places of the pairing, read only when the file is not there yet.
+    init(pairingFile: URL, legacy: [UserDefaults] = []) {
+        self.pairingFile = pairingFile
+        self.legacy = legacy
+        _pairing = Pairing.load(file: pairingFile, legacy: legacy)
     }
 
     var pairing: Pairing { lock.withLock { _pairing } }
-    var url: String { pairing.url(host: LocalAddress.host()) }
+    var url: String { pairing.url(host: LocalAddress.host(), port: activePorts.page) }
+    /// The ports the listeners use now (0 = not listening). For the page and the checks.
+    var activePorts: (page: UInt16, live: UInt16) { lock.withLock { (_activePagePort, _activeLivePort) } }
+    /// True when a link saved on the phone works now: the saved page port, and the saved or the backup live port.
+    var stablePorts: Bool {
+        lock.withLock {
+            _activePagePort != 0 && _activePagePort == _pairing.pagePort
+                && _activeLivePort != 0 && (_activeLivePort == _pairing.livePort || _activeLivePort == _pairing.backupLivePort)
+        }
+    }
     var roundTripMs: Double? { lock.withLock { _roundTripMs } }
     /// What the page last said about its display lock: "held", "no:<reason>", or nil.
     var wakeReport: String? { lock.withLock { _wakeReport } }
 
     private func updatePairing(_ change: (inout Pairing) -> Void) {
-        let copy: Pairing = lock.withLock { change(&_pairing); return _pairing }
-        copy.save(to: defaults)
+        // The save is inside the lock: a start and a Forget Phone can overlap, and the older one must not win.
+        lock.withLock { change(&_pairing); _pairing.save(file: pairingFile) }
     }
 
     func setUsesPhone(_ on: Bool, game: String) { updatePairing { $0.setUsesPhone(on, game: game) } }
@@ -74,6 +105,7 @@ final class PhoneServer {
     /// A new secret. The phone that is connected now is dropped.
     func forget() {
         updatePairing { $0.forget() }
+        Pairing.forgetLegacy(legacy)            // the forgotten secret must not come back from there
         queue.async { [self] in
             phone?.cancel()
             waiting.values.forEach { $0.cancel() }
@@ -85,10 +117,18 @@ final class PhoneServer {
     func start() {
         queue.async { [self] in
             guard pageListener == nil, liveListener == nil else { return }
+            guard state != .starting, startedGeneration != generation else { return }    // a port walk runs or gave up
+            startedGeneration = generation
             set(.starting)
             pageReady = false; liveReady = false
-            listen(live: false, port: pairing.pagePort)
-            listen(live: true, port: pairing.livePort)
+            if pairing.backupLivePort == nil {
+                let taken = [pairing.pagePort, pairing.livePort]
+                var backup = UInt16.random(in: PortChoice.range)
+                while taken.contains(backup) { backup = UInt16.random(in: PortChoice.range) }
+                updatePairing { $0.backupLivePort = backup }
+            }
+            listen(live: false, attempt: 0, generation: generation)
+            listen(live: true, attempt: 0, generation: generation)
         }
     }
 
@@ -96,6 +136,8 @@ final class PhoneServer {
         queue.async { [self] in
             // Everything ends now, in this one block, so a start() right after begins clean.
             // Only the old phone connection lives a moment longer, to let "closed" leave.
+            generation += 1
+            lock.withLock { _activePagePort = 0; _activeLivePort = 0 }
             let oldPhone = phone
             if let oldPhone { sendText(PhoneMessage.state("closed"), to: oldPhone) }
             phone = nil
@@ -121,7 +163,25 @@ final class PhoneServer {
         DispatchQueue.main.async { [weak self] in self?.onStateChange?(new) }
     }
 
-    private func listen(live: Bool, port: UInt16) {
+    /// Walks `PortChoice.step` until a listener is ready. A busy port means "next step". Only a
+    /// step with `remember` writes the port: the saved link must not change by accident.
+    private func listen(live: Bool, attempt: Int, generation started: Int) {
+        guard started == generation else { return }         // stop() came: this walk ends
+        let saved = pairing
+        let remembered = live ? saved.livePort : saved.pagePort
+        guard let step = PortChoice.step(remembered: remembered, backup: live ? saved.backupLivePort : nil, attempt: attempt) else {
+            set(.failed("The phone server did not start."))
+            return
+        }
+        guard step.wait == 0 else {
+            queue.asyncAfter(deadline: .now() + step.wait) { [weak self] in self?.open(live: live, step: step, attempt: attempt, generation: started) }
+            return
+        }
+        open(live: live, step: step, attempt: attempt, generation: started)
+    }
+
+    private func open(live: Bool, step: PortChoice.Step, attempt: Int, generation started: Int) {
+        guard started == generation else { return }
         guard let tls = try? PhoneTLS.tlsOptions() else {
             set(.failed("The phone certificate could not be made."))
             return
@@ -133,28 +193,36 @@ final class PhoneServer {
             options.maximumMessageSize = PhoneMessage.maxLength
             parameters.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
         }
-        let wanted: NWEndpoint.Port = port == 0 ? .any : (NWEndpoint.Port(rawValue: port) ?? .any)
-        guard let listener = try? NWListener(using: parameters, on: wanted) else {
-            if port != 0 { listen(live: live, port: 0) } else { set(.failed("The phone server did not start.")) }
+        guard let port = NWEndpoint.Port(rawValue: step.port), let listener = try? NWListener(using: parameters, on: port) else {
+            listen(live: live, attempt: attempt + 1, generation: started)
             return
         }
-        if live { liveListener = listener } else { pageListener = listener }
+        // A replaced listener is cancelled first: it must not keep its port.
+        if live { liveListener?.cancel(); liveListener = listener } else { pageListener?.cancel(); pageListener = listener }
         listener.newConnectionHandler = { [weak self] connection in
             if live { self?.acceptLive(connection) } else { self?.acceptPage(connection) }
         }
         listener.stateUpdateHandler = { [weak self, weak listener] newState in
-            guard let self, let listener, listener === (live ? self.liveListener : self.pageListener) else { return }
+            guard let self, let listener, started == self.generation,
+                  listener === (live ? self.liveListener : self.pageListener) else { return }
             switch newState {
             case .ready:
-                let actual = listener.port?.rawValue ?? 0
-                self.updatePairing { if live { $0.livePort = actual } else { $0.pagePort = actual } }
+                self.lock.withLock { if live { self._activeLivePort = step.port } else { self._activePagePort = step.port } }
+                if step.remember {
+                    self.updatePairing { if live { $0.livePort = step.port } else { $0.pagePort = step.port } }
+                } else {
+                    let saved = self.pairing
+                    let wanted = live ? saved.livePort : saved.pagePort
+                    let kind = step.port == saved.backupLivePort ? "the backup port" : "\(step.port) (the saved link works again next time)"
+                    self.onNote?("phone: \(live ? "live" : "page") port \(wanted) is busy; this session uses \(kind)")
+                }
                 if live { self.liveReady = true } else { self.pageReady = true }
                 if self.pageReady, self.liveReady, self.phone == nil { self.set(.waiting) }
-            case .failed(let error):
+            case .failed:
                 listener.cancel()
-                if live { self.liveListener = nil } else { self.pageListener = nil }
-                // The remembered port is in use: take a free one. A saved page then needs a new scan.
-                if port != 0 { self.listen(live: live, port: 0) } else { self.set(.failed(error.localizedDescription)) }
+                if live { self.liveListener = nil; self.liveReady = false } else { self.pageListener = nil; self.pageReady = false }
+                self.lock.withLock { if live { self._activeLivePort = 0 } else { self._activePagePort = 0 } }
+                self.listen(live: live, attempt: attempt + 1, generation: started)
             default:
                 break
             }
@@ -182,15 +250,28 @@ final class PhoneServer {
         connection.receive(minimumIncompleteLength: 1, maximumLength: PageRequest.maxLength) { [weak self] data, _, _, _ in
             guard let self else { connection.cancel(); return }
             let pairing = self.pairing
-            let allowed = data.map { PageRequest.isAuthorized($0, pairing: pairing) } ?? false
-            let body = allowed ? Data(PhonePage.html(livePort: pairing.livePort).utf8) : Data()
-            let policy = "default-src 'none'; img-src blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-                + "connect-src wss://\(LocalAddress.host()):\(pairing.livePort); base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-            let status = allowed
-                ? "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
+            let kind = data.map { PageRequest.kind($0, pairing: pairing) } ?? .denied
+            let host = LocalAddress.host()
+            let livePorts = PhonePage.livePorts(active: self.activePorts.live, remembered: pairing.livePort, backup: pairing.backupLivePort)
+            let body: Data, status: String
+            switch kind {
+            case .page:
+                body = Data(PhonePage.html(livePorts: livePorts, stable: self.stablePorts).utf8)
+                // 'self': the page puts itself in the phone's copy (cache.add).
+                let policy = "default-src 'none'; img-src blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; worker-src 'self'; "
+                    + "connect-src 'self' " + livePorts.map { "wss://\(host):\($0)" }.joined(separator: " ")
+                    + "; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+                status = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
                     + "Referrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\n"
                     + "Strict-Transport-Security: max-age=0\r\nContent-Security-Policy: \(policy)\r\n"
-                : "HTTP/1.1 404 Not Found\r\n"
+            case .worker:
+                body = Data(PhonePage.worker.utf8)
+                status = "HTTP/1.1 200 OK\r\nContent-Type: text/javascript; charset=utf-8\r\nCache-Control: no-store\r\n"
+                    + "X-Content-Type-Options: nosniff\r\n"
+            case .denied:
+                body = Data()
+                status = "HTTP/1.1 404 Not Found\r\n"
+            }
             let head = status + "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
             connection.send(content: Data(head.utf8) + body, completion: .contentProcessed { _ in connection.cancel() })
         }
@@ -308,6 +389,7 @@ final class PhoneServer {
         waitingOrder.removeAll { $0 === connection }
         let old = phone
         phone = connection
+        hellos += 1
         old?.cancel()
         gate.reset()
         onTouch?(nil)
@@ -345,6 +427,7 @@ final class PhoneServer {
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
             guard let self, let phone = self.phone else { return }
+            if self.muteForCheck { self.lastPong = CFAbsoluteTimeGetCurrent(); return }
             if CFAbsoluteTimeGetCurrent() - self.lastPong > Self.silenceLimit {
                 phone.cancel()      // dropped() releases the touch and goes back to waiting
                 return
@@ -363,7 +446,7 @@ final class PhoneServer {
     /// Call for each finished frame, from any thread.
     func submit(_ image: CGImage, split: FrameSplit) {
         queue.async { [self] in
-            guard phone != nil else { return }
+            guard phone != nil, !muteForCheck else { return }
             let r = split.lower
             guard let lower = image.cropping(to: CGRect(x: r.x, y: r.y, width: r.width, height: r.height)) else { return }
             if let next = gate.offer(lower) { send(next) }

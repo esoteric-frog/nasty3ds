@@ -22,6 +22,7 @@ Status: early (version 0.4). It runs games at full speed on an M1 MacBook Air. S
 - **The lower screen on your iPhone.** Scan one QR code. The picture goes to Safari on the phone, and your taps go back to the game. No iPhone app to install.
 - **A controller, with no setup.** A controller that macOS knows works at once (tested with an Xbox controller). The keyboard works too.
 - **Local play between two Macs.** One player hosts a room, the other joins it from a menu. The game's own local wireless (trade, battle) then works over your network.
+- **Flip Upside Down.** One button tells the game that the 3DS is upside down, for the Pokemon that evolve only then.
 - **A copy of your save before each start.** The app keeps the newest 10 copies for each game.
 
 ## How it works
@@ -57,6 +58,20 @@ To run from the source folder: `scripts/play.sh`.
 
 The Mac and the iPhone must be on the same network. With no Wi-Fi, the iPhone's Personal Hotspot works.
 
+The page keeps a copy of itself on the iPhone. A home screen icon opens even when no game runs on the Mac yet, and connects by itself when you start one.
+
+## Update
+
+Select **Nasty3DS > Check for Updates…**, or click **Check for Updates…** in Settings. Nasty3DS gets the new version from GitHub and installs it only when it is signed by the Nasty3DS maker and newer than yours. It copies all saves to `save-backups` first, closes the game, puts the new app in place and starts again. Your games, saves and iPhone setup stay as they are.
+
+A Nasty3DS older than 0.5 has no such button. On that Mac, run this line in Terminal one time. It copies all saves first and replaces only the app:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/esoteric-frog/nasty3ds/main/Resources/update.sh | zsh
+```
+
+[UPDATE.md](UPDATE.md) has the same line with the steps.
+
 ## Play with a second Mac
 
 1. Both players start a game.
@@ -74,6 +89,7 @@ scripts/test.sh          # unit tests (Swift Testing)
 scripts/check-host.sh    # the real host code against a small stand-in engine
 scripts/check-phone.sh   # the real phone server over TLS
 scripts/check-page.sh    # the real phone page in WebKit
+scripts/check-update.sh  # the real app updates itself from a local feed (needs dist/Nasty3DS.app)
 scripts/check-room.sh    # hostile packets against a real hosted room (needs a game file)
 ```
 
@@ -89,7 +105,7 @@ scripts/check-room.sh    # hostile packets against a real hosted room (needs a g
 
 Nasty3DS is licensed under [GPL-3.0-or-later](LICENSE), the same license as Azahar.
 
-- The engine is built from Azahar's source at a pinned commit. `patches/` holds the changes that Nasty3DS makes to it: a small C interface for local play rooms, and input checks in the room and local wireless code.
+- The engine is built from Azahar's source at a pinned commit. `patches/` holds the changes that Nasty3DS makes to it: a small C interface for local play rooms, input checks in the room and local wireless code, and a second sound output that has the sound effects without the music (for the rumble).
 - These patches were written with help from an AI model. Azahar's [AI policy](https://github.com/azahar-emu/azahar/blob/master/AI-POLICY.md) does not accept such code, so **do not send these patches to the Azahar project.**
 - `Sources/CN3Host/libretro.h` and `libretro_vulkan.h` come from the libretro project and keep their MIT license.
 - Nasty3DS is not affiliated with Nintendo or with the Azahar project. "Nintendo 3DS" is a trademark of Nintendo.

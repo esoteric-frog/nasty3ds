@@ -1,8 +1,50 @@
 /// The one page the phone gets. Self-contained: no outside scripts, fonts or images.
 public enum PhonePage {
-    public static func html(livePort: UInt16) -> String {
-        template.replacingOccurrences(of: "__LIVE_PORT__", with: String(livePort))
+    /// The phone's copy of the page lives in this cache. The page and the worker use the same name.
+    public static let cacheName = "nasty3ds-1"
+
+    /// `livePorts`: the ports the page tries, in order (see `livePorts(active:remembered:backup:)`).
+    /// `stable`: the ports are the saved ones, so a home screen icon made now keeps working. Only
+    /// then does the page keep a copy of itself and show the icon tip.
+    public static func html(livePorts: [UInt16], stable: Bool) -> String {
+        template.replacingOccurrences(of: "__LIVE_PORTS__", with: "[" + livePorts.map(String.init).joined(separator: ",") + "]")
+            .replacingOccurrences(of: "__STABLE__", with: stable ? "1" : "0")
+            .replacingOccurrences(of: "__CACHE__", with: cacheName)
     }
+
+    /// The port the server uses now, then the saved one, then the backup. A copy of the page kept
+    /// on the phone still finds the Mac when it listens on the backup port.
+    public static func livePorts(active: UInt16, remembered: UInt16, backup: UInt16?) -> [UInt16] {
+        var list: [UInt16] = []
+        for port in [active, remembered, backup ?? 0] where port != 0 && !list.contains(port) { list.append(port) }
+        return list
+    }
+
+    /// The service worker. It answers a page load from the Mac when the Mac answers within 2.5 s,
+    /// else from the copy, so the home screen icon opens before the Mac is ready. The slow answer
+    /// still arrives and updates the copy.
+    public static let worker = #"""
+    const CACHE = '__CACHE__';
+    self.addEventListener('install', () => self.skipWaiting());
+    self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
+    self.addEventListener('fetch', (event) => {
+      if (event.request.mode !== 'navigate') return;
+      const url = event.request.url;
+      const fresh = fetch(url, { cache: 'no-store' }).then(async (answer) => {
+        const cache = await caches.open(CACHE);
+        if (answer.ok) await cache.put(url, answer.clone());
+        else await cache.delete(url);      // the Mac forgot this phone: no old page
+        return answer;
+      });
+      event.waitUntil(fresh.catch(() => {}));      // a late answer still updates the copy
+      event.respondWith((async () => {
+        const copy = await caches.match(url, { cacheName: CACHE });
+        if (!copy) return fresh.catch(() => Response.error());
+        const late = new Promise((done) => setTimeout(done, 2500, null));
+        return (await Promise.race([fresh.catch(() => null), late])) || copy;
+      })());
+    });
+    """#.replacingOccurrences(of: "__CACHE__", with: cacheName)
 
     private static let template = #"""
     <!doctype html>
@@ -65,7 +107,19 @@ public enum PhonePage {
     const key = new URLSearchParams(location.search).get('k') || '';
     const view = document.getElementById('screen');
     const note = document.getElementById('status');
+    const ports = __LIVE_PORTS__;
+    const stable = __STABLE__ === 1;
     let socket = null, retry = 1000, lastURL = null, closed = false;
+    let tries = 0, fails = 0, retryTimer = null;
+    let lastHeard = Date.now();      // the last sign of life from the Mac
+
+    // A copy of this page stays on the phone, so the home screen icon opens before the Mac is
+    // ready. The worker does not see this first load, so the page puts itself in the copy.
+    // Not for a port of one session: that copy would not find the Mac again.
+    if (stable && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js?k=' + encodeURIComponent(key))
+        .then(() => caches.open('__CACHE__')).then((c) => c.add(location.href)).catch(() => {});
+    }
 
     function say(text, busy) {
       note.textContent = text;
@@ -101,11 +155,26 @@ public enum PhonePage {
     for (const name of ['pointerup', 'touchend', 'click']) document.addEventListener(name, holdWake, true);
     holdWake();
 
+    // One failed connection in a row. A port that never opened makes the next try use the next port.
+    function failed(opened) {
+      if (!opened) tries++;
+      fails++;
+      if (!closed) say(fails < 2 ? 'Connecting to your Mac…' : 'Start a game on your Mac. This page connects by itself.', true);
+    }
+    // An old socket must not call back: two sockets would drop each other on the Mac.
+    function drop(old) {
+      old.onopen = old.onmessage = old.onclose = null;
+      try { old.close(); } catch (e) {}
+    }
     function connect() {
-      socket = new WebSocket('wss://' + location.hostname + ':__LIVE_PORT__/');
-      socket.binaryType = 'arraybuffer';
-      socket.onopen = () => { retry = 1000; closed = false; send({ t: 'hello', k: key }); };
-      socket.onmessage = (event) => {
+      clearTimeout(retryTimer); retryTimer = null;
+      const s = new WebSocket('wss://' + location.hostname + ':' + ports[tries % ports.length] + '/');
+      let opened = false;
+      socket = s; lastHeard = Date.now();
+      s.binaryType = 'arraybuffer';
+      s.onopen = () => { opened = true; retry = 1000; fails = 0; closed = false; lastHeard = Date.now(); send({ t: 'hello', k: key }); };
+      s.onmessage = (event) => {
+        lastHeard = Date.now();
         if (typeof event.data === 'string') {
           let m; try { m = JSON.parse(event.data); } catch (e) { return; }
           if (m.t === 'ping') send({ t: 'pong', id: m.id, w: wakeLock ? 1 : 0, e: wakeError });
@@ -120,12 +189,34 @@ public enum PhonePage {
         view.src = url;
         if (!closed) say('', false);
       };
-      socket.onclose = () => {
-        if (!closed) say('Connecting to your Mac…', true);
-        setTimeout(connect, retry);
-        retry = Math.min(retry * 2, 5000);
+      s.onclose = () => {
+        failed(opened);
+        retryTimer = setTimeout(connect, retry);
+        // Wait longer only after every port was tried once, so a game start connects fast.
+        if (tries % ports.length === 0) retry = Math.min(retry * 2, 5000);
       };
     }
+    // Watchdog: a page back from the background can hold a dead socket with no close for a long
+    // time. The Mac pings each second, so 4 s of quiet on an open socket means it is dead.
+    setInterval(() => {
+      if (!socket) return;
+      const quiet = Date.now() - lastHeard, open = socket.readyState === 1;
+      if ((open && quiet > 4000) || (socket.readyState === 0 && quiet > 8000)) {
+        drop(socket);
+        failed(open);
+        connect();
+      }
+    }, 1000);
+    // Back on screen: no wait for the back-off. A socket that connects now is left alone (the
+    // first load also sends pageshow); the watchdog ends one that hangs.
+    function reconnectNow() {
+      if (document.visibilityState !== 'visible' || (socket && socket.readyState <= 1)) return;
+      if (socket) drop(socket);
+      retry = 1000;
+      connect();
+    }
+    document.addEventListener('visibilitychange', reconnectNow);
+    window.addEventListener('pageshow', reconnectNow);
 
     function point(event) {
       const r = view.getBoundingClientRect();
@@ -147,7 +238,8 @@ public enum PhonePage {
     const tip = document.getElementById('tip');
     let tipHidden = false;
     try { tipHidden = localStorage.getItem('tipHidden') === '1'; } catch (e) {}
-    if (!navigator.standalone && !tipHidden) tip.classList.add('show');
+    // An icon made on a port of one session would not open again: no tip then.
+    if (stable && !navigator.standalone && !tipHidden) tip.classList.add('show');
     document.getElementById('tipHide').addEventListener('click', () => {
       tip.classList.remove('show');
       try { localStorage.setItem('tipHidden', '1'); } catch (e) {}

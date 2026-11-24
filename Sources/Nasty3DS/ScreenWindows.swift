@@ -3,10 +3,12 @@ import Nasty3DSKit
 
 /// The game windows: which screen shows where, and the controls that show only while the pointer moves.
 /// The windows have no visible title bar: the game picture fills them.
-final class ScreenWindows: NSObject, NSWindowDelegate, NSToolbarDelegate {
+final class ScreenWindows: NSObject, NSWindowDelegate, NSToolbarDelegate, NSPopoverDelegate {
     private static let splitKey = "splitScreens"
     private static let splitItem = NSToolbarItem.Identifier("split")
     private static let phoneItem = NSToolbarItem.Identifier("usePhone")
+    private static let rumbleItem = NSToolbarItem.Identifier("rumble")
+    private static let flipItem = NSToolbarItem.Identifier("flip")
 
     private let window: NSWindow
     private let gameView: GameView
@@ -17,7 +19,20 @@ final class ScreenWindows: NSObject, NSWindowDelegate, NSToolbarDelegate {
     private var fullScreenCheckRan = false
 
     var onUsePhone: (() -> Void)?
-    var gameRuns = false { didSet { apply() } }
+    private let rumble = RumblePopover()
+    private let rumblePopover = NSPopover()
+    /// The strength of the game that runs, 0...100. Set it when a game starts.
+    var rumbleValue: Int {
+        get { rumble.value }
+        set { rumble.value = newValue; styleRumble() }
+    }
+    /// The user moved the slider.
+    var onRumbleChange: ((Int) -> Void)?
+    /// False = no controller, or a controller with no rumble motors.
+    var rumbleAvailable = false { didSet { styleRumble() } }
+    /// A game that starts or ends is never upside down: the player must not find the next game turned over.
+    /// Each set counts: a second game can start while the first one runs.
+    var gameRuns = false { didSet { setFlip(false); apply() } }
     /// The phone shows the lower screen: the Mac shows the top screen only, and no second window.
     var phoneHasLower = false { didSet { apply() } }
     var canSplit: Bool { gameRuns && !phoneHasLower }
@@ -40,6 +55,13 @@ final class ScreenWindows: NSObject, NSWindowDelegate, NSToolbarDelegate {
         gameView.companion = lowerView
         gameView.hoverHold = Self.titleBar(of: window)
         gameView.onHover = { [weak self] _ in self?.showChrome() }
+        rumblePopover.contentViewController = rumble
+        rumblePopover.behavior = .transient
+        rumblePopover.delegate = self
+        rumble.onChange = { [weak self] in
+            self?.styleRumble()
+            self?.onRumbleChange?($0)
+        }
     }
 
     /// The view that holds the window buttons and the toolbar. AppKit has no public name for it.
@@ -53,7 +75,7 @@ final class ScreenWindows: NSObject, NSWindowDelegate, NSToolbarDelegate {
 
     /// In a game, the window buttons and the toolbar show only while the pointer moves. The library shows them always.
     private func showChrome() {
-        GameView.fade([Self.titleBar(of: window)], visible: !gameRuns || gameView.hovering || Self.controlsStay)
+        GameView.fade([Self.titleBar(of: window)], visible: !gameRuns || gameView.hovering || rumblePopover.isShown || Self.controlsStay)
     }
 
     @objc func toggleSplit(_ sender: Any?) {
@@ -64,12 +86,43 @@ final class ScreenWindows: NSObject, NSWindowDelegate, NSToolbarDelegate {
 
     @objc private func usePhone(_ sender: Any?) { onUsePhone?() }
 
+    var isFlipped: Bool { gameView.upsideDown }
+
+    /// The Flip button and Game > Flip Upside Down: the game reads a console that is upside down,
+    /// and the top screen turns to show it. A second call turns it back.
+    @objc func toggleFlip(_ sender: Any?) {
+        guard gameRuns else { return }
+        setFlip(!isFlipped)
+    }
+
+    private func setFlip(_ on: Bool) {
+        if Emulator.shared.upsideDown != on { Emulator.shared.upsideDown = on }
+        if gameView.upsideDown != on { gameView.upsideDown = on }
+        styleFlip()
+    }
+
+    /// The Rumble button and Game > Rumble…: the slider opens under the button. A second call closes it.
+    @objc func showRumble(_ sender: Any?) {
+        if rumblePopover.isShown { return rumblePopover.close() }
+        guard gameRuns, rumbleAvailable,
+              let item = window.toolbar?.items.first(where: { $0.itemIdentifier == Self.rumbleItem }) else { return }
+        rumblePopover.show(relativeTo: item)
+        showChrome()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        showChrome()
+        window.makeFirstResponder(gameView)      // the keyboard plays the game again
+    }
+
     private func apply() {
         let old = layout
         layout = ScreenLayout.resolve(gameRuns: gameRuns, phoneHasLower: phoneHasLower,
                                       wantsSplit: UserDefaults.standard.bool(forKey: Self.splitKey))
         if (window.toolbar != nil) != gameRuns { window.toolbar = gameRuns ? toolbar : nil }
         showChrome()
+        if !gameRuns, rumblePopover.isShown { rumblePopover.close() }
+        styleRumble()
         if layout != old { gameView.releaseTouch(); lowerView.releaseTouch() }      // a touch must not stay down on a screen that moves
         setMainMode(layout == .oneWindow ? .both : .topOnly)
         if layout == .twoWindows { showLower() } else { hideLower() }
@@ -196,8 +249,8 @@ final class ScreenWindows: NSObject, NSWindowDelegate, NSToolbarDelegate {
 
     // MARK: toolbar (it floats on the game picture, with no bar behind it)
 
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.splitItem, Self.phoneItem] }
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.splitItem, Self.phoneItem] }
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.splitItem, Self.phoneItem, Self.rumbleItem, Self.flipItem] }
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.splitItem, Self.phoneItem, Self.rumbleItem, Self.flipItem] }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
@@ -214,6 +267,14 @@ final class ScreenWindows: NSObject, NSWindowDelegate, NSToolbarDelegate {
             item.toolTip = "Use Phone for Lower Screen"
             item.image = NSImage(systemSymbolName: "iphone", accessibilityDescription: "Use Phone for Lower Screen")
             item.action = #selector(usePhone(_:))
+        case Self.rumbleItem:
+            item.label = "Rumble"
+            item.action = #selector(showRumble(_:))
+            styleRumble(item)
+        case Self.flipItem:
+            item.label = "Flip"
+            item.action = #selector(toggleFlip(_:))
+            styleFlip(item)
         default: return nil
         }
         return item
@@ -226,5 +287,25 @@ final class ScreenWindows: NSObject, NSWindowDelegate, NSToolbarDelegate {
         item.toolTip = text
         item.image = NSImage(systemSymbolName: isSplit ? "rectangle.split.1x2" : "macwindow.on.rectangle", accessibilityDescription: text)
         item.isEnabled = canSplit
+    }
+
+    /// The button shows the state without a click: filled while the console is upside down.
+    private func styleFlip(_ item: NSToolbarItem? = nil) {
+        guard let item = item ?? window.toolbar?.items.first(where: { $0.itemIdentifier == Self.flipItem }) else { return }
+        let text = isFlipped ? "Turn the 3DS Back Up" : "Flip the 3DS Upside Down"
+        item.toolTip = text
+        item.image = NSImage(systemSymbolName: "arrow.up.and.down.righttriangle.up.righttriangle.down" + (isFlipped ? ".fill" : ""),
+                             accessibilityDescription: text)
+    }
+
+    /// The button shows the state without a click: filled when rumble is on for this game, outline when off, grey with no motors.
+    private func styleRumble(_ item: NSToolbarItem? = nil) {
+        guard let item = item ?? window.toolbar?.items.first(where: { $0.itemIdentifier == Self.rumbleItem }) else { return }
+        let off = rumbleValue == 0
+        let text = !rumbleAvailable ? "Connect a Controller That Has Rumble"
+            : off ? "Rumble Is Off for This Game" : "Rumble Strength for This Game"
+        item.toolTip = text
+        item.image = NSImage(systemSymbolName: off || !rumbleAvailable ? "gamecontroller" : "gamecontroller.fill", accessibilityDescription: text)
+        item.isEnabled = rumbleAvailable
     }
 }
