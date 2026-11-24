@@ -8,7 +8,7 @@ final class PhoneController: NSObject {
     /// (the Mac got a new name) has another fingerprint, so the setup shows again, also after a restart.
     private static let setupDoneKey = "phoneCertificateFingerprint"
 
-    let server = PhoneServer()
+    let server = PhoneServer(pairingFile: Emulator.supportDir.appendingPathComponent("phone-pairing.json"), legacy: PhoneController.legacyPairings())
     private let window: NSWindow
     /// True while the phone shows the lower screen. The owner of the windows moves the screens.
     var onLowerOnPhone: ((Bool) -> Void)?
@@ -21,6 +21,17 @@ final class PhoneController: NSObject {
     private var sendButton: NSButton?
     private var trustNote: NSTextField?
     private var pairTrustNote: NSTextField?
+    private var homeScreenNote: NSTextField?
+    private static let homeScreenText = "For full screen on the iPhone with no Safari bars: in Safari, tap Share, then Add to Home Screen. Open the game from that icon the next time. You do not scan again."
+    /// An icon made while the server uses a port for this session only would not open again.
+    private static let busyPortText = "Another app uses this Mac's phone port now. Scan this code for today. Your home screen icon works again the next time. Do not add a new icon now."
+
+    /// Where older versions kept the pairing. Only the real folder reads them.
+    private static func legacyPairings() -> [UserDefaults] {
+        let real = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Nasty3DS")
+        return Pairing.legacyStores(supportDir: Emulator.supportDir, defaultDir: real, bundleID: Bundle.main.bundleIdentifier)
+            .compactMap { name in name.map { UserDefaults(suiteName: $0) } ?? UserDefaults.standard }
+    }
 
     private static func makeTrustNote(_ text: String) -> NSTextField {
         let note = label(text, style: .body)
@@ -31,6 +42,8 @@ final class PhoneController: NSObject {
     private var qrView: NSImageView?
     private var settingsWindow: NSWindow?
     private var settingsText: NSTextField?
+    /// A second section for the Settings window, under "Phone". Set it before the first showSettings.
+    var updatesSection: NSView?
 
     init(window: NSWindow) {
         self.window = window
@@ -38,6 +51,7 @@ final class PhoneController: NSObject {
         server.onStateChange = { [weak self] in self?.stateChanged($0) }
         server.onTouch = { Emulator.shared.touch = $0 }
         server.onTrustProblem = { [weak self] in self?.trustProblem() }
+        server.onNote = { Emulator.shared.log($0) }
         Emulator.shared.onFrame = { [server] image, split in server.submit(image, split: split) }
         Emulator.shared.phoneStats = { [server] in
             (server.roundTripMs.map { String(format: "phone=%.0fms", $0) } ?? "phone=off") + " wake=" + (server.wakeReport ?? "-")
@@ -202,6 +216,8 @@ final class PhoneController: NSObject {
         qrView = qr
         let pairNote = Self.makeTrustNote("Your iPhone reached this Mac but did not accept its certificate. Click “Set Up iPhone Again…”.")
         pairTrustNote = pairNote
+        let homeNote = Self.label(Self.homeScreenText, style: .footnote, secondary: true)
+        homeScreenNote = homeNote
         let again = NSButton(title: "Set Up iPhone Again…", target: self, action: #selector(setupAgain(_:)))
         again.isBordered = false
         again.contentTintColor = .linkColor
@@ -213,7 +229,7 @@ final class PhoneController: NSObject {
             Self.label("Point your iPhone camera at this code", style: .title2),
             Self.label("The lower screen moves to the iPhone. This sheet closes by itself.", style: .body, secondary: true),
             qr, pairNote,
-            Self.label("For full screen on the iPhone with no Safari bars: in Safari, tap Share, then Add to Home Screen. Open the game from that icon the next time. You do not scan again.", style: .footnote, secondary: true),
+            homeNote,
             Self.label("No Wi-Fi? On the iPhone, turn on Personal Hotspot. Then join that network from this Mac, or connect the iPhone with a cable.", style: .footnote, secondary: true),
             buttons,
         ], spacing: 16)
@@ -249,6 +265,7 @@ final class PhoneController: NSObject {
         sendButton?.isEnabled = ready
         // The address holds the secret. It shows only as this code, never as text or in a log.
         qrView?.image = ready && !setup ? Self.qrCode(server.url) : nil
+        homeScreenNote?.stringValue = !ready || server.stablePorts ? Self.homeScreenText : Self.busyPortText
         sheet.contentView?.layoutSubtreeIfNeeded()
         if let size = sheet.contentView?.fittingSize { sheet.setContentSize(size) }
         snapshotIfAsked(sheet.contentView, name: setup ? "sheet-setup" : (ready ? "sheet-qr" : "sheet-starting"))
@@ -270,7 +287,7 @@ final class PhoneController: NSObject {
     private func closeSheet() {
         guard let panel = sheet else { return }
         window.endSheet(panel)
-        sheet = nil; setupView = nil; pairView = nil; sendButton = nil; qrView = nil; trustNote = nil; pairTrustNote = nil
+        sheet = nil; setupView = nil; pairView = nil; sendButton = nil; qrView = nil; trustNote = nil; pairTrustNote = nil; homeScreenNote = nil
     }
 
     static func qrCode(_ text: String) -> NSImage? {
@@ -296,8 +313,17 @@ final class PhoneController: NSObject {
             text.isSelectable = true
             let send = NSButton(title: "Send Certificate to iPhone…", target: self, action: #selector(sendCertificate(_:)))
             let forget = NSButton(title: "Forget Phone…", target: self, action: #selector(forgetPhone(_:)))
-            let stack = Self.column([Self.label("Phone", style: .title2), text, NSStackView(views: [send, forget])], spacing: 14)
+            var views: [NSView] = [Self.label("Phone", style: .title2), text, NSStackView(views: [send, forget])]
+            let separator = NSBox()
+            separator.boxType = .separator
+            if let updatesSection { views += [separator, updatesSection] }
+            let stack = Self.column(views, spacing: 14)
+            stack.setCustomSpacing(20, after: views[2])
+            stack.setCustomSpacing(20, after: separator)
             stack.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
+            if updatesSection != nil {
+                separator.widthAnchor.constraint(equalTo: text.widthAnchor).isActive = true
+            }
             let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 200),
                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
             panel.title = "Settings"
@@ -307,7 +333,8 @@ final class PhoneController: NSObject {
             settingsWindow = panel; settingsText = text
         }
         refreshSettings()
-        settingsWindow?.makeKeyAndOrderFront(nil)
+        // N3_BACKGROUND=1 (a check): behind the other apps, with no keyboard focus.
+        if ProcessInfo.processInfo.environment["N3_BACKGROUND"] == "1" { settingsWindow?.orderBack(nil) } else { settingsWindow?.makeKeyAndOrderFront(nil) }
     }
 
     private func refreshSettings() {

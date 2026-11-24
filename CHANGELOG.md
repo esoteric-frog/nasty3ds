@@ -4,6 +4,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-23
+
+### Added
+- Flip Upside Down (the Flip button in the game window, also Game > Flip Upside Down): the game reads a 3DS that is upside down, and the top screen turns to show it. Some Pokemon evolve only then (Inkay, at level 30 or more). Each game starts not flipped.
+- Games that read the tilt sensor now get a steady reading: a console that lies flat.
+- `Resources/update.sh` with no app next to it gets the newest release from GitHub. One line in Terminal updates a Mac whose Nasty3DS has no update button. It copies all saves first.
+
+### Changed
+- Rumble: the rumble listens to the sound effects only. The music gives no rumble. Before, a drum in the music gave a thump, also in calm places.
+
+## [0.5.0] - 2026-11-19
+
+### Added
+- Settings > Check for Updates… (also in the Nasty3DS menu): gets a new version from GitHub, checks its signature, copies all saves, installs it and starts again. Games and saves stay as they are.
+- Rumble: the controller gives a thump on each big sudden sound in the game, and a soft pulse in the triggers on a sudden sharp sound. A drum in the music can give a thump too. The game window has a Rumble button with one strength slider for each game (Game > Rumble…). 0 turns it off.
+
+### Fixed
+- The iPhone home screen icon keeps working: the phone ports stay the same (a busy port gets a port for one session only, and the live connection has a backup port), the app and a test build share one pairing file, and the page keeps a copy of itself, so the icon opens before the Mac is ready and connects by itself.
+- The sound stops when the Mac changes its sound device in the middle of a game (headphones, AirPlay, a TV). Now the sound starts again on the new device.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added

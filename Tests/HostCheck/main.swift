@@ -9,6 +9,14 @@ win.contentView = gv
 gv.layoutSubtreeIfNeeded()
 let mode = CommandLine.arguments[1]
 Emulator.shared.view = gv
+// "sfx": the sound effects of the core must come out of Emulator.onEffects, on the emulation thread.
+var effectFrames = 0, effectBad = 0
+if mode == "sfx" {
+  Emulator.shared.onEffects = { samples, frames in
+    effectFrames += frames
+    for i in 0..<(frames * 2) where samples[i] != 1234 { effectBad += 1 }
+  }
+}
 do { try Emulator.shared.start(gamePath: "/tmp/game.3ds") } catch { print("start threw:", error); exit(2) }
 spin(0.4)
 if mode == "view" {
@@ -45,4 +53,25 @@ if mode == "restart" {
   Emulator.shared.stop(); print("stopped; start again")
   do { try Emulator.shared.start(gamePath: "/tmp/game2.3ds") } catch { print("second start threw:", error) }
   spin(0.3); print("fps:", Emulator.shared.measuredFPS); Emulator.shared.stop(); print("probe end"); exit(0)
+}
+if mode == "sfx" {
+  let has = Emulator.shared.hasEffects
+  Emulator.shared.stop()
+  print("effects has=\(has) frames=\(effectFrames) bad=\(effectBad)"); exit(0)
+}
+if mode == "flip" {
+  // The switch must reach the core as a new tilt reading, and each new game must start flat.
+  print("flip: upsideDown=\(Emulator.shared.upsideDown)")
+  Emulator.shared.upsideDown = true; spin(0.2)
+  print("flip: upsideDown=\(Emulator.shared.upsideDown)")
+  gv.upsideDown = true
+  print("flip: top=\(gv.topLayer.affineTransform()) lower=\(gv.lowerLayer.affineTransform())")
+  gv.layoutSubtreeIfNeeded()
+  print("flip: topFrame=\(gv.topLayer.frame)")
+  gv.upsideDown = false
+  print("flip: back top=\(gv.topLayer.affineTransform())")
+  do { try Emulator.shared.start(gamePath: "/tmp/game2.3ds") } catch { print("second start threw:", error) }
+  spin(0.2)
+  print("flip: after a new game upsideDown=\(Emulator.shared.upsideDown)")
+  Emulator.shared.stop(); exit(0)
 }

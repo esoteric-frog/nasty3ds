@@ -16,8 +16,23 @@ final class Emulator {
     var map = ControllerMap.automatic
     weak var view: GameView?
     var onAudio: ((UnsafePointer<Int16>, Int) -> Void)?
+    /// The game's sound effects without the music, after each frame on the emulation thread. Same format as onAudio.
+    var onEffects: ((UnsafePointer<Int16>, Int) -> Void)?
+    /// True when the loaded engine gives the sound effects without the music.
+    var hasEffects: Bool { n3_has_effects() != 0 }
     /// Called on the emulation thread for each finished frame.
     var onFrame: ((CGImage, FrameSplit) -> Void)?
+    /// The game's tilt sensor reads "the console is upside down" (some Pokemon evolve only then).
+    /// Each game starts with false. Main thread.
+    var upsideDown = false {
+        didSet {
+            let tilt = upsideDown ? Self.flipTilt : Tilt.upright
+            n3_set_accel(tilt.x, tilt.y, tilt.z)
+            if upsideDown != oldValue { log("[n3] upside down = \(upsideDown) tilt \(tilt.x) \(tilt.y) \(tilt.z)") }
+        }
+    }
+    /// Diagnosis aid: N3_FLIP_ACCEL=x,y,z (in g) is the upside-down reading for this run.
+    private static let flipTilt = ProcessInfo.processInfo.environment["N3_FLIP_ACCEL"].flatMap(Tilt.init(text:)) ?? .upsideDown
     private(set) var sampleRate = 32728.0
     private(set) var measuredFPS = 0.0
 
@@ -82,6 +97,7 @@ final class Emulator {
         let logURL = Self.supportDir.appendingPathComponent("core.log")
         fm.createFile(atPath: logURL.path, contents: nil)
         logFile = try FileHandle(forWritingTo: logURL)
+        upsideDown = false
 
         // The core keeps these pointers. They are never freed: one game per process in Part 1.
         let options: [(String, String)] = [
@@ -106,6 +122,10 @@ final class Emulator {
         }
         config.audio = { samples, frames in
             Emulator.shared.onAudio?(samples!, frames)
+            return frames
+        }
+        config.effects = { samples, frames in
+            Emulator.shared.onEffects?(samples!, frames)
             return frames
         }
         config.input = { port, device, index, id in
@@ -240,6 +260,13 @@ final class Emulator {
     }
 
     func log(_ line: String) {
-        logFile?.write(Data((line.hasSuffix("\n") ? line : line + "\n").utf8))
+        let data = Data((line.hasSuffix("\n") ? line : line + "\n").utf8)
+        if let logFile { logFile.write(data); return }
+        // No game runs (the updater, for one): add the line to the end of the last log.
+        let url = Self.supportDir.appendingPathComponent("core.log")
+        guard let handle = try? FileHandle(forWritingTo: url) else { try? data.write(to: url); return }
+        handle.seekToEndOfFile()
+        handle.write(data)
+        try? handle.close()
     }
 }

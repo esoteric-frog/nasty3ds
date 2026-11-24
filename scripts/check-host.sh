@@ -31,3 +31,27 @@ awk '
     if (bad) exit 1
     print "PASS: check-host"
   }' $O/twice.out
+
+# The sound effects of the core (for the controller rumble) must reach Emulator.onEffects.
+CFFIXED_USER_HOME=$O/home DYLD_LIBRARY_PATH=$O ./driver sfx > $O/sfx.out 2>&1 || true
+grep -Eq '^effects has=true frames=[1-9][0-9]* bad=0$' $O/sfx.out || { cat $O/sfx.out; echo "FAIL: the sound effects did not reach onEffects"; exit 1; }
+# A core without that output: no effects, and no crash.
+mkdir -p $O/old/vendor/core && cp driver $O/old/
+clang -dynamiclib -DNO_SFX -I $R/Sources/CN3Host $R/Tests/HostCheck/stubcore.c -o $O/old/vendor/core/azahar_libretro.dylib
+(cd $O/old && CFFIXED_USER_HOME=$O/home DYLD_LIBRARY_PATH=$O ./driver sfx > $O/nosfx.out 2>&1 || true)
+grep -q '^effects has=false frames=0 bad=0$' $O/nosfx.out || { cat $O/nosfx.out; echo "FAIL: a core with no sound effects output must give has=false"; exit 1; }
+echo "PASS: check-host sound effects"
+
+# Flip Upside Down: the core asks the host for the tilt sensor. It must read "flat" at the start,
+# the upside-down value after the switch, and "flat" again in the next game. The top picture turns.
+CFFIXED_USER_HOME=$O/home DYLD_LIBRARY_PATH=$O ./driver flip > $O/flip.out 2>&1 || true
+want() { grep -Eq -- "$1" $O/flip.out || { cat $O/flip.out; echo "FAIL: flip: $2"; exit 1; } }
+want '^\[stub\] accel enable=1 gyro enable=1$' "the host did not give the tilt sensor"
+want '^flip: upsideDown=false$' "a game must start not flipped"
+[[ "$(grep -E '^\[stub\] accel [-0-9]' $O/flip.out | tr '\n' '|')" == "[stub] accel 0.000 -1.000 0.000 gyro 0.000|[stub] accel 0.000 0.500 0.866 gyro 0.000|[stub] accel 0.000 -1.000 0.000 gyro 0.000|" ]] \
+  || { cat $O/flip.out; echo "FAIL: flip: the core must read flat, then upside down, then flat in the next game"; exit 1; }
+want '^flip: top=.*a: -1\.0, b: 0\.0, c: 0\.0, d: -1\.0.* lower=.*a: 1\.0, b: 0\.0, c: 0\.0, d: 1\.0' "only the top picture must turn"
+want '^flip: topFrame=\(0\.0, 0\.0, 800\.0, 480\.0\)$' "the turned top picture must stay in its place"
+want '^flip: back top=.*a: 1\.0, b: 0\.0, c: 0\.0, d: 1\.0' "the top picture must turn back"
+want '^flip: after a new game upsideDown=false$' "a new game must start not flipped"
+echo "PASS: check-host flip"

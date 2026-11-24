@@ -21,6 +21,9 @@ typedef struct {
     n3_audio_fn audio;
     n3_input_fn input;
     n3_log_fn log;
+    /* The game's sound effects without the music (same format and rate as audio), for the controller
+       rumble. Called after each frame on the emulation thread. Never called when the core has no such output. */
+    n3_audio_fn effects;
 } n3_config;
 
 /* 0 = ok. On failure, err holds a message. */
@@ -29,6 +32,10 @@ int  n3_load_game(const char *game_path, char *err, size_t err_len);
 void n3_av_info(unsigned *width, unsigned *height, double *fps, double *sample_rate);
 void n3_run(void);      /* one frame; emulation thread only */
 void n3_unload(void);
+int  n3_has_effects(void);   /* 1 = the loaded core gives the sound effects without the music */
+/* What the game's tilt sensor reads, in g (x = left and right, y = out of the lower screen,
+   z = to the hinge). The start value is a console that lies flat: 0, -1, 0. Any thread. */
+void n3_set_accel(float x, float y, float z);
 
 /* Local play (the 3DS "local wireless", for example a trade). One player hosts a room, the
    others join it. Every function returns -1 when the loaded core has no room support.

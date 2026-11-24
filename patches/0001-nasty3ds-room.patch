@@ -1,3 +1,208 @@
+diff --git a/src/audio_core/hle/hle.cpp b/src/audio_core/hle/hle.cpp
+index ba8cae289..372b15ccc 100644
+--- a/src/audio_core/hle/hle.cpp
++++ b/src/audio_core/hle/hle.cpp
+@@ -3,6 +3,10 @@
+ // Refer to the LICENSE.txt file included.
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <vector>
+ 
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/base_object.hpp>
+@@ -435,6 +439,34 @@ HLE::SharedMemory& DspHle::Impl::WriteRegion() {
+     return CurrentRegionIndex() != 0 ? dsp_memory->region_0 : dsp_memory->region_1;
+ }
+ 
++namespace {
++std::mutex n3_sfx_mutex;
++std::vector<s16> n3_sfx; // interleaved stereo
++constexpr std::size_t n3_sfx_cap = static_cast<std::size_t>(native_sample_rate) * 2;
++
++/// Nasty3DS: true when this voice is a sound effect. A music stream runs for a long time and gets
++/// one buffer after the other; a sound effect is short.
++/// A music stream also keeps a line of buffers that wait (4 in Pokemon X, from its first frame); a
++/// sound effect has at most one.
++constexpr bool N3IsSfx(const HLE::Source::N3Info& info) {
++    return info.run_frames < 614 && info.run_buffers <= 2 && info.queued <= 1; // 614 frames = 3 s
++}
++// Fields: buffer_id, flags, queued, run_frames, run_buffers. The cases are from a recording of real play.
++static_assert(N3IsSfx({1, 0x02, 0, 70, 1}), "a short sound is a sound effect");
++static_assert(N3IsSfx({1, 0x12, 1, 400, 2}), "a short sound that repeats is a sound effect");
++static_assert(!N3IsSfx({1, 0x01, 4, 0, 1}), "the first frame of a music stream is not a sound effect");
++static_assert(!N3IsSfx({9, 0x01, 0, 50, 30}), "a stream with many buffers is not a sound effect");
++static_assert(!N3IsSfx({1, 0x12, 1, 614, 1}), "a sound that goes on for 3 s is not a sound effect");
++} // namespace
++
++std::size_t N3SfxRead(s16* dst, std::size_t max_frames) {
++    std::scoped_lock lock{n3_sfx_mutex};
++    const std::size_t frames = std::min(max_frames, n3_sfx.size() / 2);
++    std::copy_n(n3_sfx.begin(), frames * 2, dst);
++    n3_sfx.erase(n3_sfx.begin(), n3_sfx.begin() + static_cast<std::ptrdiff_t>(frames * 2));
++    return frames;
++}
++
+ StereoFrame16 DspHle::Impl::GenerateCurrentFrame() {
+     HLE::SharedMemory& read = ReadRegion();
+     HLE::SharedMemory& write = WriteRegion();
+@@ -450,6 +482,60 @@ StereoFrame16 DspHle::Impl::GenerateCurrentFrame() {
+         }
+     }
+ 
++    // Nasty3DS: the sound effects without the music, for the controller rumble.
++    // Diagnosis: N3_DUMP_VOICES=/path/voices.bin gets each voice of each frame. One frame: u32 mask of the
++    // voices that are on, then for each one: u16 buffer id, u8 flags, u8 queued, u16 buffers, 160 s16 mono.
++    {
++        static std::FILE* const dump = [] {
++            const char* path = std::getenv("N3_DUMP_VOICES");
++            return path ? std::fopen(path, "wb") : nullptr;
++        }();
++        std::array<std::array<s32, 2>, samples_per_frame> sfx = {};
++        std::array<StereoFrame16, HLE::num_sources> voice;
++        std::array<HLE::Source::N3Info, HLE::num_sources> info;
++        u32 mask = 0;
++        for (std::size_t i = 0; i < HLE::num_sources; i++) {
++            if (!sources[i].N3Voice(voice[i], info[i])) {
++                continue;
++            }
++            mask |= 1u << i;
++            if (N3IsSfx(info[i])) {
++                for (std::size_t s = 0; s < samples_per_frame; s++) {
++                    sfx[s][0] += voice[i][s][0];
++                    sfx[s][1] += voice[i][s][1];
++                }
++            }
++        }
++        {
++            std::scoped_lock lock{n3_sfx_mutex};
++            if (n3_sfx.size() >= n3_sfx_cap) {
++                n3_sfx.clear(); // nobody reads
++            }
++            for (const auto& s : sfx) {
++                n3_sfx.push_back(static_cast<s16>(std::clamp(s[0], -32768, 32767)));
++                n3_sfx.push_back(static_cast<s16>(std::clamp(s[1], -32768, 32767)));
++            }
++        }
++        if (dump) {
++            std::fwrite(&mask, sizeof(mask), 1, dump);
++            for (std::size_t i = 0; i < HLE::num_sources; i++) {
++                if (!(mask & (1u << i))) {
++                    continue;
++                }
++                const u16 buffers = static_cast<u16>(std::min<u32>(info[i].run_buffers, 65535));
++                std::array<s16, samples_per_frame> mono;
++                for (std::size_t s = 0; s < samples_per_frame; s++) {
++                    mono[s] = static_cast<s16>((voice[i][s][0] + voice[i][s][1]) / 2);
++                }
++                std::fwrite(&info[i].buffer_id, sizeof(u16), 1, dump);
++                std::fwrite(&info[i].flags, 1, 1, dump);
++                std::fwrite(&info[i].queued, 1, 1, dump);
++                std::fwrite(&buffers, sizeof(u16), 1, dump);
++                std::fwrite(mono.data(), sizeof(s16), samples_per_frame, dump);
++            }
++        }
++    }
++
+     // Generate final mix
+     write.dsp_status = mixers.Tick(read.dsp_configuration, read.intermediate_mix_samples,
+                                    write.intermediate_mix_samples, intermediate_mixes);
+diff --git a/src/audio_core/hle/hle.h b/src/audio_core/hle/hle.h
+index 81c5d55f7..359d0f8eb 100644
+--- a/src/audio_core/hle/hle.h
++++ b/src/audio_core/hle/hle.h
+@@ -53,4 +53,8 @@ private:
+     friend class boost::serialization::access;
+ };
+ 
++/// Nasty3DS: gives the sound of the sound effects only (no music), stereo, 32728 Hz, and removes it
++/// from the store. Returns the number of frames. The store holds one second at most.
++std::size_t N3SfxRead(s16* dst, std::size_t max_frames);
++
+ } // namespace AudioCore
+diff --git a/src/audio_core/hle/source.cpp b/src/audio_core/hle/source.cpp
+index 730e973d9..8758acb1d 100755
+--- a/src/audio_core/hle/source.cpp
++++ b/src/audio_core/hle/source.cpp
+@@ -20,6 +20,10 @@ SourceStatus::Status Source::Tick(SourceConfiguration::Configuration& config,
+ 
+     if (state.enabled) {
+         GenerateFrame();
++        n3_run_frames++;
++    } else {
++        n3_run_frames = 0;
++        n3_run_buffers = 0;
+     }
+ 
+     return GetCurrentStatus();
+@@ -64,6 +68,27 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
+ void Source::Reset() {
+     current_frame.fill({});
+     state = {};
++    n3_run_frames = 0;
++    n3_run_buffers = 0;
++}
++
++bool Source::N3Voice(StereoFrame16& out, N3Info& info) const {
++    if (!state.enabled) {
++        return false;
++    }
++    const float left = state.gain[0][0], right = state.gain[0][1];
++    for (std::size_t i = 0; i < samples_per_frame; i++) {
++        out[i][0] = static_cast<s16>(std::clamp(left * current_frame[i][0], -32768.0f, 32767.0f));
++        out[i][1] = static_cast<s16>(std::clamp(right * current_frame[i][1], -32768.0f, 32767.0f));
++    }
++    info.buffer_id = state.current_buffer_id;
++    info.flags = static_cast<u8>(static_cast<u8>(state.current_buffer_format) |
++                                 (state.current_buffer_is_looping ? 0x10 : 0) |
++                                 (state.current_buffer_mono_or_stereo == MonoOrStereo::Stereo ? 0x20 : 0));
++    info.queued = static_cast<u8>(std::min<std::size_t>(state.input_queue.size(), 255));
++    info.run_frames = n3_run_frames;
++    info.run_buffers = n3_run_buffers;
++    return true;
+ }
+ 
+ void Source::Sleep() {
+@@ -484,6 +509,10 @@ bool Source::DequeueBuffer() {
+         return true;
+     }
+ 
++    if (!buf.has_played) {
++        n3_run_buffers++;
++    }
++
+     // the first playthrough starts at play_position, loops start at the beginning of the buffer
+     state.current_sample_number = (!buf.has_played) ? buf.play_position : 0;
+     state.current_buffer_physical_address = buf.physical_address;
+diff --git a/src/audio_core/hle/source.h b/src/audio_core/hle/source.h
+index ea58ab6d9..f96a1b3f1 100755
+--- a/src/audio_core/hle/source.h
++++ b/src/audio_core/hle/source.h
+@@ -67,7 +67,22 @@ public:
+      */
+     void MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id);
+ 
++    /// Nasty3DS: facts about one voice in the current frame.
++    struct N3Info {
++        u16 buffer_id;
++        u8 flags;        ///< bits 0-3 format, 0x10 looping, 0x20 stereo
++        u8 queued;       ///< buffers that wait in the queue
++        u32 run_frames;  ///< frames since this voice started
++        u32 run_buffers; ///< buffers that this voice started since it started
++    };
++    /// Nasty3DS: the sound of this voice in the current frame, with the gain of the main mix.
++    /// False when the voice is off.
++    bool N3Voice(StereoFrame16& out, N3Info& info) const;
++
+ private:
++    u32 n3_run_frames = 0;  // not in save states on purpose: the save state format stays the same
++    u32 n3_run_buffers = 0;
++
+     const std::size_t source_id;
+     Memory::MemorySystem* memory_system{};
+     StereoFrame16 current_frame;
 diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
 index e28f9941b..0d5855da0 100644
 --- a/src/citra_libretro/CMakeLists.txt
@@ -19,10 +224,10 @@ index e28f9941b..0d5855da0 100644
  if(ENABLE_VULKAN)
    target_link_libraries(citra_libretro PRIVATE sirit vulkan-headers vma)
 diff --git a/src/citra_libretro/libretro.osx.def b/src/citra_libretro/libretro.osx.def
-index 53a556a60..e83ee5941 100644
+index 53a556a60..c335a32c5 100644
 --- a/src/citra_libretro/libretro.osx.def
 +++ b/src/citra_libretro/libretro.osx.def
-@@ -25,3 +25,10 @@ _retro_unload_game
+@@ -25,3 +25,11 @@ _retro_unload_game
  _retro_get_region
  _retro_get_memory_data
  _retro_get_memory_size
@@ -33,12 +238,13 @@ index 53a556a60..e83ee5941 100644
 +_nasty3ds_room_members
 +_nasty3ds_room_shutdown
 +_nasty3ds_room_init
++_nasty3ds_sfx_read
 diff --git a/src/citra_libretro/nasty3ds_room.cpp b/src/citra_libretro/nasty3ds_room.cpp
 new file mode 100644
-index 000000000..a4a90f740
+index 000000000..709d9e4c2
 --- /dev/null
 +++ b/src/citra_libretro/nasty3ds_room.cpp
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,189 @@
 +// Nasty3DS: local wireless play for the libretro core.
 +// The 3DS "local wireless" (UDS) of this emulator goes through a "room": one player hosts a
 +// room, the others join it. The libretro core has no way to start one, so the host app calls
@@ -48,6 +254,7 @@ index 000000000..a4a90f740
 +#include <cstring>
 +#include <mutex>
 +#include <string>
++#include "audio_core/hle/hle.h"
 +#include "common/logging/log.h"
 +#include "core/core.h"
 +#include "core/hle/service/cfg/cfg.h"
@@ -219,6 +426,11 @@ index 000000000..a4a90f740
 +        Network::Shutdown();
 +        network_ready = false;
 +    }
++}
++
++/// The sound of the sound effects only, for the controller rumble. See AudioCore::N3SfxRead.
++__attribute__((visibility("default"))) size_t nasty3ds_sfx_read(int16_t* dst, size_t max_frames) {
++    return AudioCore::N3SfxRead(dst, max_frames);
 +}
 +
 +} // extern "C"

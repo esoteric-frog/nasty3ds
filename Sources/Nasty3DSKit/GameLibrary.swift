@@ -146,4 +146,28 @@ public final class GameLibrary {
         for old in others.dropLast(Self.backupsKept - 1) { try? fm.removeItem(at: home.appendingPathComponent(old)) }
         return copy
     }
+
+    /// Copies the whole `saves` folder to `save-backups/All saves before update <yyyy-MM-dd-HHmmss>/saves`
+    /// and returns that folder. Nil when there is no saves folder. Throws when the copy fails: then
+    /// no part of a copy stays, and the update must not start.
+    public func backUpAllSaves(now: Date = Date()) throws -> URL? {
+        let saves = folder.appendingPathComponent("saves")
+        guard fm.fileExists(atPath: saves.path) else { return nil }
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.dateFormat = "yyyy-MM-dd-HHmmss"            // the same name as Resources/update.sh makes
+        let home = folder.appendingPathComponent("save-backups")
+        let copy = home.appendingPathComponent("All saves before update " + format.string(from: now))
+        // Copy under a working name, then rename: a copy cut short never counts as a backup.
+        let partial = home.appendingPathComponent(".partial-" + UUID().uuidString)
+        do {
+            try fm.createDirectory(at: partial, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try fm.copyItem(at: saves, to: partial.appendingPathComponent("saves"))
+            try fm.moveItem(at: partial, to: copy)
+        } catch {
+            try? fm.removeItem(at: partial)
+            throw error
+        }
+        return copy
+    }
 }

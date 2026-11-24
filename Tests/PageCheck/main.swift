@@ -10,8 +10,8 @@ var failures = 0
 func check(_ ok: Bool, _ name: String) { print(ok ? "ok   " : "FAIL ", name); if !ok { failures += 1 } }
 
 PhoneTLS.folder = FileManager.default.temporaryDirectory.appendingPathComponent("nasty3ds-pagecheck-\(UUID().uuidString)")
-let defaults = UserDefaults(suiteName: "nasty3ds.pagecheck.\(UUID().uuidString)")!
-let server = PhoneServer(defaults: defaults)
+let pairingFile = FileManager.default.temporaryDirectory.appendingPathComponent("nasty3ds-pagecheck-pairing-\(UUID().uuidString).json")
+let server = PhoneServer(pairingFile: pairingFile)
 var states: [PhoneServer.State] = []
 var touches: [String] = []
 let touchLock = NSLock()
@@ -52,6 +52,9 @@ func testImage() -> CGImage {
 let page = Page()
 let config = WKWebViewConfiguration()
 config.websiteDataStore = .nonPersistent()
+// The check window is off screen, so the page is "hidden", and WebKit slows the timers of a
+// hidden page to many seconds. A phone runs the page on screen: let the timers run at speed.
+config.preferences.inactiveSchedulingPolicy = .none
 config.userContentController.add(page, name: "errors")
 config.userContentController.addUserScript(WKUserScript(source: """
     window.addEventListener('error', (e) => window.webkit.messageHandlers.errors.postMessage('script: ' + e.message + ' @line ' + e.lineno));
@@ -81,6 +84,93 @@ func finish() {
     try? FileManager.default.removeItem(at: PhoneTLS.folder)
     print(failures == 0 ? "PASS: check-page" : "FAILED: \(failures) checks")
     exit(failures == 0 ? 0 : 1)
+}
+
+func pause(_ seconds: Double) async { try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) }
+@MainActor func eval(_ source: String) async -> String {
+    await withCheckedContinuation { done in js(source) { done.resume(returning: $0) } }
+}
+/// For a script that awaits: the result of its `return`, as text.
+@MainActor func evalAsync(_ body: String) async -> String {
+    do { return "\(try await web.callAsyncJavaScript(body, contentWorld: .page) ?? "nil")" } catch { return "error: \(error)" }
+}
+@MainActor func waitUntil(_ seconds: Double, _ condition: () async -> Bool) async -> Bool {
+    let end = Date().addingTimeInterval(seconds)
+    while Date() < end { if await condition() { return true }; await pause(0.25) }
+    return false
+}
+@MainActor func pictureLive() async -> Bool {
+    let live = await eval("String(document.getElementById('screen').classList.contains('live'))")
+    return states.last == .connected && live == "true"
+}
+@MainActor func statusText() async -> String {
+    await eval("document.getElementById('status') ? document.getElementById('status').textContent : 'no page'")
+}
+/// A plain listening socket on `port`: another program that holds the port.
+func holdPort(_ port: UInt16) -> Int32 {
+    let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+    var one: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+    var a = sockaddr_in()
+    a.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); a.sin_family = sa_family_t(AF_INET)
+    a.sin_port = port.bigEndian; a.sin_addr.s_addr = INADDR_ANY
+    let ok = withUnsafePointer(to: &a) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+    guard ok == 0, Darwin.listen(fd, 4) == 0 else { print("hold \(port) failed: errno \(errno)"); close(fd); return -1 }
+    return fd
+}
+
+/// The parts after the first live picture: a dead link with no close, the copy of the page on
+/// the phone (service worker), and the backup live port.
+@MainActor func laterParts() async {
+    // A link that dies with no close (a page back from the background can hold one): the page
+    // must replace it by itself, and only once.
+    let before = server.helloCount
+    server.muteForCheck = true
+    let muted = Date()
+    let replaced = await waitUntil(12) { server.helloCount > before }
+    let took = Date().timeIntervalSince(muted)
+    server.muteForCheck = false
+    check(replaced && took < 10.5, "watchdog: a link that goes quiet with no close is replaced by a new one, after \(String(format: "%.1f", took)) s")
+    let recovered = server.helloCount
+    await pause(10)
+    check(server.helloCount - recovered <= 1, "watchdog: at most one new connection in the 10 s after recovery, got \(server.helloCount - recovered)")
+    check(await pictureLive(), "watchdog: the picture is live again: \(states.suffix(3))")
+
+    // The copy of the page on the phone (the home screen icon opens before the Mac is ready).
+    guard await eval("String('serviceWorker' in navigator)") == "true" else {
+        print("SKIP: this WebKit view has no service worker")
+        return
+    }
+    var controlled = await waitUntil(10) { await eval("String(!!navigator.serviceWorker.controller)") == "true" }
+    if !controlled {
+        web.reload()
+        controlled = await waitUntil(10) { await eval("String(!!navigator.serviceWorker.controller)") == "true" }
+    }
+    check(controlled, "offline: the service worker controls the page")
+    let primed = await evalAsync("const c = await caches.open('nasty3ds-1'); return String(!!(await c.match(location.href)));")
+    check(primed == "true", "offline: the page is in the phone's copy: \(primed)")
+    server.stop()
+    await pause(0.5)
+    page.errors.removeAll()
+    web.reload()
+    let offline = await waitUntil(15) { await statusText().contains("Start a game on your Mac.") }
+    let shown = await statusText()
+    check(offline && page.errors.isEmpty, "offline: with the Mac not serving, the page opens from the copy and says what to do: \(shown) \(page.errors)")
+    server.start()
+    check(await waitUntil(15) { await pictureLive() }, "offline: when the Mac serves again, frames come with no reload")
+
+    // The copy finds the Mac on the backup live port when another program holds the saved one.
+    let live = server.pairing.livePort, backup = server.pairing.backupLivePort ?? 0
+    server.stop()
+    await pause(0.5)
+    web.reload()
+    _ = await waitUntil(15) { await statusText().contains("Start a game on your Mac.") }
+    let holder = holdPort(live)
+    server.start()
+    let onBackup = await waitUntil(30) { await pictureLive() }
+    check(holder >= 0 && onBackup && server.activePorts.live == backup,
+          "backup port: the copy of the page connects on the backup port \(backup) with no new scan: \(server.activePorts)")
+    if holder >= 0 { close(holder) }
 }
 
 server.start()
@@ -129,8 +219,11 @@ after(2.0) {
                                 check(hidden.contains(#""shown":"none""#) && hidden.contains(#""stored":"1""#), "Hide removes the note and remembers it: \(hidden)")
                                 after(1.5) {     // the report rides on the next ping, one each second
                                     check(server.wakeReport == "held", "the page reports its display lock to the Mac: \(String(describing: server.wakeReport))")
-                                    frames.invalidate()
-                                    finish()
+                                    Task { @MainActor in
+                                        await laterParts()
+                                        frames.invalidate()
+                                        finish()
+                                    }
                                 }
                             }
                         }

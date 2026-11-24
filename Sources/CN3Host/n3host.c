@@ -35,9 +35,21 @@ static struct {
     int (*room_state)(void);
     int (*room_members)(char *, unsigned long);
     void (*room_shutdown)(void);
+    size_t (*sfx_read)(int16_t *, size_t);
 } core;
 
 static n3_config cfg;
+
+/* The tilt sensor, in g. Written on the main thread, read on the emulation thread, so each number
+   is atomic. One frame may see a mix of the old and the new value, and that does no harm. */
+static _Atomic float accel[3] = {0, -1, 0};
+void n3_set_accel(float x, float y, float z) { accel[0] = x; accel[1] = y; accel[2] = z; }
+static bool sensor_state(unsigned port, enum retro_sensor_action action, unsigned rate) {
+    (void)port; (void)action; (void)rate;
+    return true;
+}
+/* The accelerometer ids are 0, 1, 2. The console does not turn, so the gyroscope reads 0. */
+static float sensor_input(unsigned port, unsigned id) { return port == 0 && id < 3 ? accel[id] : 0; }
 
 static void host_log(int level, const char *fmt, ...) {
     if (!cfg.log) return;
@@ -87,6 +99,13 @@ static bool environment(unsigned cmd, void *data) {
     case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
         *(bool *)data = false;
         return true;
+    case RETRO_ENVIRONMENT_GET_SENSOR_INTERFACE: {
+        struct retro_sensor_interface *s = data;
+        s->set_sensor_state = sensor_state;
+        s->get_sensor_input = sensor_input;
+        host_log(RETRO_LOG_INFO, "[n3] the core reads the tilt sensor from the host");
+        return true;
+    }
     case RETRO_ENVIRONMENT_GET_JIT_CAPABLE:
         *(bool *)data = true;
         return true;
@@ -181,6 +200,7 @@ int n3_load_core(const char *dylib_path, const n3_config *config, char *err, siz
     OPT(room_state, "nasty3ds_room_state");
     OPT(room_members, "nasty3ds_room_members");
     OPT(room_shutdown, "nasty3ds_room_shutdown");
+    OPT(sfx_read, "nasty3ds_sfx_read");
     /* Before the game loads: the game's wireless service links to the network when it starts. */
     if (core.room_init && core.room_init() != 0) host_log(RETRO_LOG_WARN, "[n3] local play network did not start");
     return 0;
@@ -206,7 +226,17 @@ void n3_av_info(unsigned *width, unsigned *height, double *fps, double *sample_r
     *sample_rate = av.timing.sample_rate;
 }
 
-void n3_run(void) { if (core.handle && core.game_loaded) core.run(); }
+void n3_run(void) {
+    if (!core.handle || !core.game_loaded) return;
+    core.run();
+    if (core.sfx_read && cfg.effects) {
+        static int16_t block[2 * 1024];
+        size_t frames;
+        while ((frames = core.sfx_read(block, 1024)) > 0) cfg.effects(block, frames);
+    }
+}
+
+int n3_has_effects(void) { return core.handle && core.sfx_read; }
 
 void n3_unload(void) {
     if (!core.handle) return;

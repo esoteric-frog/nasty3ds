@@ -15,6 +15,18 @@ final class GameView: NSView {
         didSet { lowerLayer.isHidden = mode == .topOnly; topLayer.isHidden = mode == .lowerOnly; needsLayout = true }
     }
 
+    /// The top screen shows upside down, as on a 3DS that the player turned over. The lower screen
+    /// stays as it is: a touch must land where the finger is.
+    var upsideDown = false {
+        didSet {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)      // no slow turn: the picture is a game screen, not a control
+            // scale -1, -1 is a half turn with exact numbers (a rotation by pi leaves 1e-16 in the frame)
+            topLayer.setAffineTransform(upsideDown ? CGAffineTransform(scaleX: -1, y: -1) : .identity)
+            CATransaction.commit()
+        }
+    }
+
     /// A second view that shows the same frames (the window for the lower screen).
     weak var companion: GameView?
 
